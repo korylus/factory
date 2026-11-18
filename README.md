@@ -313,7 +313,7 @@ korylusfactoryは、作業計画書を進めるときに、git・`wikino` コマ
 それぞれを入れて、`PATH` から実行できるようにしておきます。
 `start` を使う前に、対象プロジェクトでClaude CodeとCodexのセッションから必要なKorylusスキルを使えるようにしておきます。
 
-miseとMakeを用意し、`korylus/factory` のリポジトリのルートで次を実行します。
+miseとMakeと、Rustのリンカに使うCコンパイラ (GCCまたはClang) を用意し、`korylus/factory` のリポジトリのルートで次を実行します。
 
 ```sh
 mise install

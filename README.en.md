@@ -315,7 +315,7 @@ While advancing work plans, korylusfactory launches git, the `wikino` command, C
 Install each tool and make it available on `PATH`.
 Before running `start`, make sure Claude Code and Codex sessions can use the required Korylus skills in the target project.
 
-Install mise and Make, then run these commands from the root of the `korylus/factory` repository.
+Install mise, Make, and a C compiler (GCC or Clang) used by Rust as the linker, then run these commands from the root of the `korylus/factory` repository.
 
 ```sh
 mise install
