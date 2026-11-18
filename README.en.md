@@ -190,7 +190,8 @@ The notification command (`notify` in the configuration file) runs once when a p
 When the item could not be added, it announces the wait without the URL, and announces it again with the URL once the item is added.
 The notice items for a first work plan that cannot be read and for branches that are not merged are announced, with the URL, only once the item is added.
 Without the human queue, these two situations are not announced.
-The command receives only the following environment variables, never the item's body.
+The notification command inherits the caller's environment.
+korylusfactory passes notification data only through the environment variables listed below.
 
 | Environment variable     | Content                                                                                                                                                |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -311,18 +312,22 @@ The per-task records use the same field names as `tasks` in [korylusflow](https:
 ## Installing
 
 While advancing work plans, korylusfactory launches git, the `wikino` command, Claude Code, and Codex.
-Install each of them and make them runnable from `PATH`.
+Install each tool and make it available on `PATH`.
+Before running `start`, make sure Claude Code and Codex sessions can use the required Korylus skills in the target project.
+
+Install mise and Make, then run these commands from the root of the `korylus/factory` repository.
 
 ```sh
 mise install
-make install-korylusfactory
+mise exec -- make install-korylusfactory
 ```
 
 `make install-korylusfactory` builds it and places it at `~/.local/bin/korylusfactory` (change the location with `BINDIR=<directory>`).
 It is built with the Rust version in `mise.toml`.
 Use the built executable so that switching branches while `start` is running does not change the code being run.
 
-After installing, `korylusfactory --version` shows the commit and the location of the repository it was built from.
+After installing to the default location, run `~/.local/bin/korylusfactory --version` to see the source commit and repository location.
+Add the directory containing the executable to `PATH` to run `korylusfactory` by name.
 When the outdated warning appears (see "[Warning when outdated](#warning-when-outdated)"), reinstall with the same command.
 
 ## Development
@@ -339,19 +344,19 @@ Dependencies go in one direction: each crate in the table depends on the crate r
 External processes are launched only from `korylusfactory-cli`, never from `korylusfactory-core` or `korylus-workdoc`.
 
 Tool versions are kept in `mise.toml`.
-Oxfmt, used to format Markdown and other files, is installed with pnpm.
+From the root of the `korylus/factory` repository, use pnpm to install Oxfmt, which formats Markdown and other files.
 
 ```sh
 mise install
-pnpm install
+mise exec -- pnpm install
 ```
 
 ```sh
-make install-korylusfactory  # build korylusfactory (to ~/.local/bin/korylusfactory)
-make test                    # run the tests
-make lint                    # run clippy
-make fmt                     # format with rustfmt + Oxfmt
-make fmt-check               # check formatting
+mise exec -- make install-korylusfactory  # build korylusfactory (to ~/.local/bin/korylusfactory)
+mise exec -- make test                    # run the tests
+mise exec -- make lint                    # run clippy
+mise exec -- make fmt                     # format with rustfmt + Oxfmt
+mise exec -- make fmt-check               # check formatting
 ```
 
 CI runs `make fmt-check`, `make lint`, and `make test` on pushes to `main` and on pull requests.

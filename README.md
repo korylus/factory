@@ -188,7 +188,8 @@ Wikinoに読み書きできないときは警告を出し、1分空けてやり�
 項目を積めなかったときはURLを渡さずに知らせ、積めたらURLを渡してもう一度知らせます。
 並びの先頭を読み取れないことと、ブランチが取り込まれていないことの知らせの項目は、項目を積めたときだけ、URLを渡して知らせます。
 人間キューを使わない設定では、この2つの場面は知らせません。
-コマンドには次の環境変数だけを渡し、項目の本文は渡しません。
+通知のコマンドは呼び出し元の環境を引き継ぎます。
+korylusfactoryがコマンドに渡す通知の内容は、次の環境変数に限られます。
 
 | 環境変数                 | 内容                                                                                                             |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
@@ -310,17 +311,21 @@ korylusfactoryのバージョンと、これから進める作業計画書の並
 
 korylusfactoryは、作業計画書を進めるときに、git・`wikino` コマンド・Claude Code・Codexを起動します。
 それぞれを入れて、`PATH` から実行できるようにしておきます。
+`start` を使う前に、対象プロジェクトでClaude CodeとCodexのセッションから必要なKorylusスキルを使えるようにしておきます。
+
+miseとMakeを用意し、`korylus/factory` のリポジトリのルートで次を実行します。
 
 ```sh
 mise install
-make install-korylusfactory
+mise exec -- make install-korylusfactory
 ```
 
 `make install-korylusfactory` でビルドし、`~/.local/bin/korylusfactory` に置きます (`BINDIR=<ディレクトリ>` で置き場所を変えられます)。
 ビルドには、`mise.toml` のRustを使います。
 `start` を動かしている間にブランチを切り替えても実行中のコードが変わらないよう、ビルドした実行ファイルを使います。
 
-入れたあと、`korylusfactory --version` でビルド元のコミットとリポジトリの場所を確かめられます。
+既定の場所に入れたあとは、`~/.local/bin/korylusfactory --version` でビルド元のコミットとリポジトリの場所を確かめられます。
+実行ファイルを置いたディレクトリを `PATH` に加えると、`korylusfactory` を名前で実行できます。
 古いときの警告 (「[古いときの警告](#古いときの警告)」) が出たら、同じコマンドで入れ直します。
 
 ## 開発
@@ -337,19 +342,19 @@ Cargoのワークスペース (`crates/`) に、次のクレートを置いて�
 外部プロセスの起動は `korylusfactory-cli` に閉じ、`korylusfactory-core` と `korylus-workdoc` からは起動しません。
 
 ツールの版は `mise.toml` で持ちます。
-Markdownなどの整形に使うOxfmtは、pnpmで入れます。
+Markdownなどの整形に使うOxfmtは、`korylus/factory` のリポジトリのルートでpnpmを使って入れます。
 
 ```sh
 mise install
-pnpm install
+mise exec -- pnpm install
 ```
 
 ```sh
-make install-korylusfactory  # korylusfactoryをビルド (~/.local/bin/korylusfactory)
-make test                    # テストを実行
-make lint                    # clippyを実行
-make fmt                     # rustfmt + Oxfmtでフォーマット
-make fmt-check               # フォーマットチェック
+mise exec -- make install-korylusfactory  # korylusfactoryをビルド (~/.local/bin/korylusfactory)
+mise exec -- make test                    # テストを実行
+mise exec -- make lint                    # clippyを実行
+mise exec -- make fmt                     # rustfmt + Oxfmtでフォーマット
+mise exec -- make fmt-check               # フォーマットチェック
 ```
 
 CIでは、`main` へのpushとPull Requestで `make fmt-check`・`make lint`・`make test` を実行します。
