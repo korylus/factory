@@ -181,8 +181,7 @@ impl<'a> Tree<'a> {
         self.lines(id)
             .into_iter()
             .next()
-            .map(|line| line.text)
-            .unwrap_or_default()
+            .map_or_default(|line| line.text)
     }
 
     /// ブロックの全行を空白でつないだ本文を返す。

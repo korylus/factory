@@ -164,8 +164,7 @@ impl Kind {
         }
         let required: Vec<&String> = properties
             .as_object()
-            .map(|object| object.keys().collect())
-            .unwrap_or_default();
+            .map_or_default(|object| object.keys().collect());
         json!({
             "type": "object",
             "additionalProperties": false,

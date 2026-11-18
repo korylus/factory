@@ -469,12 +469,10 @@ fn parse_declarations(s: &str) -> Result<Vec<Declaration>, String> {
         }
         decls.push(Declaration {
             name: name.to_owned(),
-            note: note
-                .map(|note| {
-                    let note = note.trim();
-                    note.strip_suffix(')').unwrap_or(note).trim().to_owned()
-                })
-                .unwrap_or_default(),
+            note: note.map_or_default(|note| {
+                let note = note.trim();
+                note.strip_suffix(')').unwrap_or(note).trim().to_owned()
+            }),
         });
     }
     Ok(decls)

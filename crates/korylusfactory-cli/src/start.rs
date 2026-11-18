@@ -450,8 +450,7 @@ impl Director<'_, '_> {
         self.settle(|notice| notice.kind == NoticeKind::PlanUnreadable)?;
         let title = entries
             .first()
-            .map(|entry| entry.candidate.link.title.clone())
-            .unwrap_or_default();
+            .map_or_default(|entry| entry.candidate.link.title.clone());
         // 古いkorylusfactoryで作業計画書を始めないよう、始める前にも確かめる。
         let freshness = version::check(self.start.runner, self.start.build);
         if matches!(freshness, Freshness::Stale { .. }) {

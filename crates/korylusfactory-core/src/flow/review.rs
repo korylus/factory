@@ -512,8 +512,7 @@ fn task_prefix(state: &mut PlanState, project: &Project, id: &str) -> Result<Str
         let name = record
             .repo
             .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy());
         format!("{name}-{}", record.branch)
     };
     record.review.review_prefix = Some(prefix.clone());

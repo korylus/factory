@@ -364,7 +364,7 @@ impl Reader<'_> {
             }
             g.pending = 0;
             let list = self.next_list(id);
-            let options = list.map(|list| self.options(list)).unwrap_or_default();
+            let options = list.map_or_default(|list| self.options(list));
             let summary = self.summary(line.start);
             self.findings.push(Finding {
                 section: section.to_owned(),
