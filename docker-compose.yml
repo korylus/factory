@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.dev
+    volumes:
+      - .:/workspace
+      - op-config:/home/developer/.config/op
+      - wikino-cli-config:/home/developer/.config/wikino
+    ports:
+      - "4600:8080"
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    environment:
+      - BINDING=0.0.0.0
+      - OP_SERVICE_ACCOUNT_TOKEN=${OP_SERVICE_ACCOUNT_TOKEN:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+
+volumes:
+  op-config:
+  wikino-cli-config:
