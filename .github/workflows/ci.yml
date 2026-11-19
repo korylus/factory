@@ -23,8 +23,10 @@ jobs:
       - uses: actions/checkout@v7
       # Rust・Node.js・pnpmのバージョンは、開発コンテナと同じくmise.tomlから読む。
       - uses: jdx/mise-action@v5
-      - name: Oxfmtを入れる
+      - name: OxfmtとウェブアプリのCSSのツールを入れる
         run: pnpm install --frozen-lockfile
+      # ウェブアプリはリポジトリに入れたCSSとJavaScriptを埋め込むため、テンプレートやトークンと食い違っていないかを確かめる。
+      - run: make web-assets-check
       - uses: Swatinem/rust-cache@v2
       - run: make fmt-check
       - run: make lint

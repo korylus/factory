@@ -9,10 +9,10 @@ name = "korylusfactory"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.6.7", features = ["derive"] }
+clap.workspace = true
 jiff.workspace = true
 korylusfactory-core = { path = "../korylusfactory-core" }
-rustix = { version = "1.1.6", features = ["process"] }
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

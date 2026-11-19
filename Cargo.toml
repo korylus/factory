@@ -9,7 +9,9 @@ publish = false
 
 # 2つ以上のクレートで使う依存のバージョンをここで持ち、各クレートは `workspace = true` で引き継ぐ。
 [workspace.dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
 jiff = "0.2.43"
+rustix = { version = "1.1.6", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"

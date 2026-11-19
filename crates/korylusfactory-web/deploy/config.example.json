@@ -1,0 +1,6 @@
+{
+  "listen": "0.0.0.0:8000",
+  "database": "/home/<ユーザー>/.local/state/korylusfactory-web/factory.sqlite3",
+  "owners": ["owner@example.com"],
+  "directors": [{ "vm": "annict-factory", "project": "Annict" }]
+}

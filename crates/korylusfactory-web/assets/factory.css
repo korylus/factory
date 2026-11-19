@@ -1,0 +1,48 @@
+/* デザインシステムの「Basecoatとの接続」の拡張のCSS。
+   Basecoatのスタイルは @layer components の中にあるため、レイヤーの外に書いたこちらが常に優先される。 */
+
+/* ブラウザが描く既定のUI (スクロールバーやフォーム部品) の配色を、html.dark の有無に揃える。
+   Basecoatは .dark にだけ color-scheme: dark を置くため、ライトの側を自分で置く。
+   これが無いと、JavaScriptが動かずに dark クラスが付かない端末で、既定のUIだけがダークで描かれる。 */
+:root:not(.dark) {
+  color-scheme: light;
+}
+
+/* 人間待ち: <span class="badge" data-variant="warning"> */
+.badge[data-variant="warning"] {
+  background-color: var(--warning);
+  color: var(--warning-foreground);
+}
+
+/* 実行中: <span class="badge" data-variant="info">。Basecoatの destructive と同じ薄い面 */
+.badge[data-variant="info"] {
+  background-color: color-mix(in oklab, var(--info) 10%, transparent);
+  color: var(--info);
+}
+html.dark .badge[data-variant="info"] {
+  background-color: color-mix(in oklab, var(--info) 20%, transparent);
+}
+
+/* 人間待ちの知らせ: <div class="alert" data-variant="warning"> */
+.alert[data-variant="warning"] {
+  border-color: var(--warning);
+  background-color: color-mix(in oklab, var(--warning) 12%, var(--card));
+  color: var(--foreground);
+}
+/* 本文の muted-foreground は琥珀の面の上で4.5:1に届かないため、foreground にする。 */
+.alert[data-variant="warning"] > section {
+  color: var(--foreground);
+}
+
+/* htmxの要求中の目印。htmxが実行時に差し込むスタイルシートはCSPの外で作られるため、
+   差し込みを止め (layout.html の htmx-config)、同じ規則をここに置く。 */
+.htmx-indicator {
+  opacity: 0;
+  visibility: hidden;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 200ms ease-in;
+}
