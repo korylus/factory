@@ -529,8 +529,11 @@ When you deliberately need a version published less than 3 days ago, such as a s
 CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate> --precise <version>
 ```
 
+This command can also select versions published less than 3 days ago for transitive dependencies of the specified crate.
+Check the changes to `Cargo.lock` after the update.
+
 Until the upgraded version is 3 days old, do not run `cargo update` without naming a crate.
-Doing so reverts it to a version that is at least 3 days old.
+Doing so can downgrade it to a version that is at least 3 days old.
 
 `make dev-web` uses the settings in `crates/korylusfactory-web/config.dev.json` and listens on port 8080.
 Because the development environment has no exe.dev proxy, it treats every request as coming from the development identity written in the settings.
