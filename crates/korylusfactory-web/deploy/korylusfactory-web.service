@@ -1,0 +1,22 @@
+# 管制のウェブアプリを、ログインしていない間も動かし続けるsystemdのユーザーのユニットの見本。
+# ~/.config/systemd/user/ に写し、`systemctl --user enable --now korylusfactory-web` で起動する。
+# 手順はリポジトリのREADMEの「管制のウェブアプリ」を参照する。
+
+[Unit]
+Description=Korylus Factoryの管制のウェブアプリ
+# 設定の誤りなどで失敗が続くときは、1分間に5回まで起動する。
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+# make install-korylusfactory-web が置く実行ファイルと、設定ファイルの置き場。
+ExecStart=%h/.local/bin/korylusfactory-web --config %E/korylusfactory-web/config.json
+# DBを置くディレクトリ (既定は ~/.local/state/korylusfactory-web) を、起動の前に作る。
+StateDirectory=korylusfactory-web
+# 落ちたときは、起動回数の上限まで5秒空けて起動し直す。
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

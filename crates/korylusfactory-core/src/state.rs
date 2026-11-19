@@ -13,7 +13,7 @@
 mod item;
 mod record;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -441,6 +441,17 @@ impl Store {
     ///
     /// 状態の置き場の中の、計画書名に使えない名前のディレクトリと、状態ファイルの無いディレクトリは数えない。
     pub fn plans(&self) -> Result<Vec<(String, PlanState)>, Error> {
+        let mut plans = Vec::new();
+        for name in self.plan_names()? {
+            if let Some(state) = self.plan(&name)?.load()? {
+                plans.push((name, state));
+            }
+        }
+        Ok(plans)
+    }
+
+    /// 状態の置き場にある計画書名を、状態ファイルを読まずに名前順で返す。
+    pub fn plan_names(&self) -> Result<Vec<String>, Error> {
         let list_error = |source| Error::List {
             path: self.root.clone(),
             source,
@@ -455,21 +466,13 @@ impl Store {
             let entry = entry.map_err(list_error)?;
             if entry.file_type().map_err(list_error)?.is_dir()
                 && let Some(name) = entry.file_name().to_str()
+                && self.plan(name).is_ok()
             {
                 names.push(name.to_owned());
             }
         }
         names.sort();
-        let mut plans = Vec::new();
-        for name in names {
-            let Ok(dir) = self.plan(&name) else {
-                continue;
-            };
-            if let Some(state) = dir.load()? {
-                plans.push((name, state));
-            }
-        }
-        Ok(plans)
+        Ok(names)
     }
 }
 
@@ -519,23 +522,42 @@ impl PlanDir {
     ///
     /// 返したロックを捨てると、ロックが外れる。
     pub fn lock(&self) -> Result<Lock, Error> {
-        let path = self.path.join(LOCK_FILE);
-        let lock_error = |source| Error::Lock {
-            path: path.clone(),
-            source,
-        };
-        fs::create_dir_all(&self.path).map_err(lock_error)?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(lock_error)?;
-        file.lock().map_err(lock_error)?;
+        let file = self.open_lock_file()?;
+        file.lock().map_err(|source| self.lock_error(source))?;
         Ok(Lock {
             dir: self.clone(),
             _file: file,
         })
+    }
+
+    /// 状態ファイルの排他ロックを待たずに取る。ほかが持っていれば `None` を返す。
+    pub fn try_lock(&self) -> Result<Option<Lock>, Error> {
+        let file = self.open_lock_file()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Lock {
+                dir: self.clone(),
+                _file: file,
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(source)) => Err(self.lock_error(source)),
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<File, Error> {
+        fs::create_dir_all(&self.path).map_err(|source| self.lock_error(source))?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.join(LOCK_FILE))
+            .map_err(|source| self.lock_error(source))
+    }
+
+    fn lock_error(&self, source: io::Error) -> Error {
+        Error::Lock {
+            path: self.path.join(LOCK_FILE),
+            source,
+        }
     }
 }
 

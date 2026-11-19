@@ -8,13 +8,14 @@
 //! 状態ファイルの読み取りから次のステップの判定・書き込みまでは、1つのファイルロックの中で行う。
 //! セッションの実行中は、ロックを持たない。
 //!
-//! 止めるときのシグナルは扱わず、既定の動作で終わる。
-//! 実行中のセッションは、セッションの監督プロセスが呼び出し元の終わりを取り消しとして扱い、子孫まで終わらせる。
+//! ウェブに報告するプロジェクトでは、実行ファイルから取り消しを受け取り、セッションと送信を終了する。
+//! シグナルの既定動作で終わった場合も、セッションの監督プロセスが子孫まで終わらせる。
 //! 状態はセッションの結果を記録する前のまま残るため、次に起動したときに同じステップをやり直す。
 
 mod alert;
 mod items;
 mod prepare;
+mod reporting;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -26,7 +27,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -45,8 +46,10 @@ use crate::process::{Launcher, Runner};
 use crate::roadmap::{self, Entry, State};
 use crate::source::{self, Kind, Wikino};
 use crate::version::{self, Build, Freshness};
+use crate::web::Link;
 use crate::{agent, branch, describe, instruction, status};
 use alert::TITLE_PREFIX;
+use reporting::Reporting;
 use session::Launch;
 
 /// 二重起動を防ぐロックに使うファイルの、プロジェクトのルートからの相対パス。
@@ -187,15 +190,42 @@ pub trait Clock {
 
 /// 本物の時計。
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemClock;
+pub struct SystemClock<'a> {
+    cancel: Option<&'a AtomicBool>,
+}
 
-impl Clock for SystemClock {
+impl<'a> SystemClock<'a> {
+    /// 長い待ちの途中でも、キャンセル後はすぐに監督のループへ戻れる時計を作る。
+    pub fn new(cancel: &'a AtomicBool) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+
+    /// テストでは短い待機の処理を差し替え、待機が始まってから取り消せるようにする。
+    fn sleep_with(self, duration: Duration, mut wait: impl FnMut(Duration)) {
+        let Some(cancel) = self.cancel else {
+            wait(duration);
+            return;
+        };
+        let started = Instant::now();
+        while !cancel.load(Ordering::SeqCst) {
+            let remaining = duration.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            wait(remaining.min(Duration::from_millis(200)));
+        }
+    }
+}
+
+impl Clock for SystemClock<'_> {
     fn now(&self) -> Timestamp {
         Timestamp::now()
     }
 
     fn sleep(&self, duration: Duration) {
-        thread::sleep(duration);
+        self.sleep_with(duration, thread::sleep);
     }
 }
 
@@ -218,6 +248,8 @@ pub struct Start<'a> {
     pub time_zone: &'a TimeZone,
     /// 実行しているkorylusfactoryのビルド元の情報。古いかどうかを確かめる。
     pub build: &'a Build,
+    /// 状態の報告を管制のウェブアプリへ送る経路。設定に「web」が無ければ使わない。
+    pub web: &'a Link,
     /// プロジェクトのルート。
     pub root: &'a Path,
     /// 待つ時間と、セッションの時間の上限。
@@ -246,7 +278,17 @@ pub fn run(
     err: &mut dyn Write,
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    let config = config::load(start.root)?;
+    run_configured(start, config::load(start.root)?, out, err, cancel)
+}
+
+/// 読み取り済みの設定を使って監督のループを進める。
+pub fn run_configured(
+    start: &Start<'_>,
+    config: Config,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
     let _running = hold(start.root)?;
     // 前のstartが先に終了しても、そのセッションの後始末が終わるまでは起動しない。
     drop(
@@ -259,9 +301,21 @@ pub fn run(
         root: start.root.to_path_buf(),
         repo: branch::toplevel(start.runner, start.root)?,
     };
+    let reporting = config.web.as_ref().and_then(|endpoint| {
+        match Reporting::new(endpoint, start, &config) {
+            Ok(reporting) => Some(reporting),
+            Err(error) => {
+                (start.web.warn)(&format!(
+                    "ウェブアプリに送るスレッドを起動できません: {error}。作業計画書は進め続けます"
+                ));
+                None
+            }
+        }
+    });
     let mut director = Director {
         start,
         config,
+        reporting,
         project,
         store: Store::new(start.root),
         notices: Notices::new(start.root),
@@ -292,6 +346,8 @@ pub fn run(
                 Pace::Sleep(start.timing.roadmap)
             }
         };
+        // 状態ファイルを書いたあとの状態を送る。セッションは終わっているため、実行中ではない。
+        director.report(false);
         if let Pace::Sleep(duration) = pace
             && !cancel.load(Ordering::SeqCst)
         {
@@ -343,6 +399,8 @@ enum Pace {
 struct Director<'a, 's> {
     start: &'a Start<'s>,
     config: Config,
+    /// 状態の報告を管制のウェブアプリへ送る。設定に「web」が無ければ `None`。
+    reporting: Option<Reporting>,
     project: Project,
     store: Store,
     /// 状態ファイルに持たない待ちに積んだ、知らせの項目の記録。
@@ -421,6 +479,9 @@ impl Director<'_, '_> {
     /// 進める作業計画書が無いときと、先頭を読み取れないときは、理由を表示して `None` を返す。
     fn begin(&mut self) -> Result<Option<(String, PlanState)>, Error> {
         let entries = roadmap::load(self.start.runner, &self.config, &self.store)?;
+        if let Some(reporting) = &mut self.reporting {
+            reporting.use_roadmap(entries.clone(), self.start.clock.now());
+        }
         let (url, name) = match queue::head(&entries) {
             Head::Empty => {
                 self.rung.clear();
@@ -611,6 +672,8 @@ impl Director<'_, '_> {
         };
         lock.save(&state)?;
         drop(lock);
+        // セッションを始める前の状態を送る。セッションの間は、送るスレッドが間隔ごとに送り直す。
+        self.report(true);
         self.title(&format!(
             "{TITLE_PREFIX} - {name} - {}",
             describe_next(&next)
@@ -647,6 +710,13 @@ impl Director<'_, '_> {
             url: url.to_owned(),
             source,
         })
+    }
+
+    /// 現在の状態を送信スレッドへ渡す。送信や報告用のロードマップの取得は待たない。
+    fn report(&mut self, running: bool) {
+        if let Some(reporting) = &mut self.reporting {
+            reporting.update(running, self.start.clock.now());
+        }
     }
 
     /// 進み具合textを表示する。進んだため、待っている理由を表示し直せるようにする。

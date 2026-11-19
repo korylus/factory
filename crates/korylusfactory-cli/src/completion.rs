@@ -178,6 +178,7 @@ mod tests {
             sections: vec!["やってる".to_owned()],
             done_sections: vec!["リリース待ち".to_owned(), "やった".to_owned()],
             project: None,
+            web: None,
         }
     }
 

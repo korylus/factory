@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <script src="{{ crate::assets::theme_path() }}"></script>
+    <title>{% block title %}{% endblock %}Korylus Factory</title>
+    <meta name="robots" content="noindex" />
+    <link rel="icon" href="data:," />
+    <meta name="htmx-config" content='{"includeIndicatorCSS": false}' />
+    <link rel="stylesheet" href="{{ crate::assets::stylesheet_path() }}" />
+    <script src="{{ crate::assets::htmx_path() }}" defer></script>
+    <script src="{{ crate::assets::sse_path() }}" defer></script>
+  </head>
+  <body class="min-h-screen bg-page text-foreground">
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:absolute focus:start-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-card focus:px-3 focus:py-2 focus:text-sm"
+      >本文へ移動</a
+    >
+    <header class="border-b bg-card">
+      <div class="mx-auto flex h-12 max-w-[720px] items-center px-4">
+        <a href="/" class="text-sm font-semibold">Korylus Factory</a>
+      </div>
+    </header>
+    <main id="main" tabindex="-1" class="mx-auto flex max-w-[720px] flex-col gap-4 py-6 md:px-4">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

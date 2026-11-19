@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal as _, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
@@ -10,7 +11,7 @@ use korylusfactory_cli::human_queue::{WikinoStore, command as queue};
 use korylusfactory_cli::process::System;
 use korylusfactory_cli::start::{self, Start, SystemClock, Timing};
 use korylusfactory_cli::version::{self, Build};
-use korylusfactory_cli::{completion, config, describe, resume, roadmap, status};
+use korylusfactory_cli::{completion, config, describe, resume, roadmap, status, web};
 use korylusfactory_core::state::{Store, Wait, WaitKind};
 
 /// バージョン番号に、ビルド元のコミットとビルドした日を添えた文字列。
@@ -131,28 +132,42 @@ fn main() -> ExitCode {
 
 /// `korylusfactory start` を、今のディレクトリをプロジェクトのルートとして実行する。
 ///
-/// 止めるときはシグナルの既定の動作で終わり、実行中のセッションはセッションの監督プロセスが終わらせる。
+/// ウェブに報告する場合は、Ctrl+Cでセッションと報告の送信を片付ける。
 fn run_start() -> Result<(), Box<dyn Error>> {
     let root = env::current_dir()?;
+    let config = config::load(&root)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let clock = if config.web.is_some() {
+        let interrupt = signal_hook::consts::SIGINT;
+        // 通常のキャンセルで待ちきれないときは、2回目のCtrl+Cで既定の動作を選べる。
+        signal_hook::flag::register_conditional_default(interrupt, Arc::clone(&cancel))?;
+        signal_hook::flag::register(interrupt, Arc::clone(&cancel))?;
+        SystemClock::new(&cancel)
+    } else {
+        SystemClock::default()
+    };
     let build = Build::current();
     let start = Start {
         runner: &System,
         launcher: &System,
-        clock: &SystemClock,
+        clock: &clock,
         queues: &System,
         notifier: &System,
         terminal: io::stderr().is_terminal(),
         // 項目の日時は、実行している環境のタイムゾーン (環境変数TZか、システムの設定) で書く。
         time_zone: &TimeZone::system(),
         build: &build,
+        web: &web::Link::system(),
         root: &root,
         timing: Timing::default(),
     };
-    start::run(
+    // 状態の報告を送るスレッドも警告を標準エラーに書くため、標準エラーはロックし続けず、書くたびにロックする。
+    start::run_configured(
         &start,
+        config,
         &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
-        &AtomicBool::new(false),
+        &mut io::stderr(),
+        &cancel,
     )?;
     Ok(())
 }

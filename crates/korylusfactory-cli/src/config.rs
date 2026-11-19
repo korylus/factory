@@ -9,7 +9,8 @@
 //!   "done_sections": ["リリース待ち", "やった"],
 //!   "project": "mewst",
 //!   "queue": {"space": "<スペース>", "topic": 12},
-//!   "notify": {"command": ["<通知のコマンド>", "<引数>"]}
+//!   "notify": {"command": ["<通知のコマンド>", "<引数>"]},
+//!   "web": {"url": "https://<管制のウェブアプリ>"}
 //! }
 //! ```
 //!
@@ -18,6 +19,7 @@
 //! `project` はプロジェクト名で、`queue` か `notify` を書くときは必ず書く。
 //! `queue` は人間キューの置き場 (Wikinoのスペースとトピック) で、省略すると項目を積まない。
 //! `notify` は人間待ちを知らせるコマンドで、省略すると知らせない。
+//! `web` は状態を送る管制のウェブアプリで、省略すると送らない。
 
 use std::fs;
 use std::io;
@@ -31,6 +33,7 @@ use serde::Deserialize;
 
 use crate::human_queue::Location;
 use crate::source::{self, Kind, Wikino};
+use crate::web::Endpoint;
 
 /// プロジェクトのルートからの、設定ファイルの相対パス。
 pub const CONFIG_PATH: &str = "docs/private/factory/config.json";
@@ -128,6 +131,13 @@ pub enum Error {
         .0.display()
     )]
     NoNotifyCommand(PathBuf),
+
+    /// 管制のウェブアプリのURLが、HTTPかHTTPSのURLではない。
+    #[error(
+        "設定ファイル {} の「web」の「url」を使えません。ホストのあるHTTPかHTTPSのURLを、資格情報・クエリ・フラグメントを含めずに書いてください",
+        .0.display()
+    )]
+    InvalidWeb(PathBuf),
 }
 
 /// 設定ファイルのJSONの形。
@@ -140,6 +150,14 @@ struct File {
     project: Option<String>,
     queue: Option<QueueFile>,
     notify: Option<NotifyFile>,
+    web: Option<WebFile>,
+}
+
+/// 設定ファイルの「web」の形。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFile {
+    url: String,
 }
 
 /// 設定ファイルの「queue」の形。
@@ -168,6 +186,8 @@ pub struct Config {
     pub done_sections: Vec<String>,
     /// プロジェクト名と、人間待ちの置き場・知らせ方。「project」を書かなければ `None`。
     pub project: Option<Project>,
+    /// 状態を送る管制のウェブアプリのURL。「web」を書かなければ `None` で、状態を送らない。
+    pub web: Option<Endpoint>,
 }
 
 /// プロジェクト名と、そのプロジェクトの人間待ちの置き場・知らせ方。
@@ -230,12 +250,17 @@ pub fn load(root: &Path) -> Result<Config, Error> {
             sections: overlapping,
         });
     }
+    let web = file
+        .web
+        .map(|web| Endpoint::parse(&web.url).ok_or_else(|| Error::InvalidWeb(path.clone())))
+        .transpose()?;
     let project = read_project(path, file.project, file.queue, file.notify)?;
     Ok(Config {
         roadmap,
         sections,
         done_sections,
         project,
+        web,
     })
 }
 
@@ -323,7 +348,37 @@ mod tests {
                 ],
                 done_sections: vec!["リリース待ち".to_owned(), "やった".to_owned()],
                 project: None,
+                web: None,
             }
+        );
+    }
+
+    #[test]
+    fn ウェブアプリのurlを読み取る() {
+        let root = project(
+            r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {"url": "https://factory.example.com"}}"#,
+        );
+
+        let config = load(root.path()).expect("設定を読めなかった");
+
+        assert_eq!(
+            config.web.as_ref().map(Endpoint::as_str),
+            Some("https://factory.example.com/api/v1/director/status"),
+            "ウェブアプリのURLを読み取らなかった"
+        );
+    }
+
+    #[test]
+    fn ウェブアプリのurlがhttpでなければ誤りにする() {
+        let root = project(
+            r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {"url": "factory.example.com"}}"#,
+        );
+
+        let result = load(root.path());
+
+        assert!(
+            matches!(result, Err(Error::InvalidWeb(_))),
+            "httpでないURLを受け付けた: {result:?}"
         );
     }
 

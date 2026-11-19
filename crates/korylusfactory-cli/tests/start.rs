@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use korylusfactory_core::state::{Step, Store};
+use korylusfactory_protocol::StatusReport;
 
 /// 偽物のwikinoとClaude Codeを `PATH` の先頭に置いた、作業計画書を1つ進めるプロジェクト。
 struct Project {
@@ -395,5 +398,150 @@ fn finish_previous(project: &Project, base: &Path, previous: u32) {
             Err(std::fs::TryLockError::WouldBlock) => false,
             Err(err) => panic!("排他を確認できなかった: {err}"),
         },
+    );
+}
+
+/// 接続や子プロセスの終了を観測する。期限は、状態が変わらない場合の打ち切りに使う。
+fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(result) = check() {
+            return Some(result);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        thread::park_timeout(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+/// 報告と接続を返す。テストから任意の時点で204を返せるようにする。
+fn receive_report(listener: &TcpListener, timeout: Duration) -> (StatusReport, TcpStream) {
+    let stream = wait_for(timeout, || match listener.accept() {
+        Ok((stream, _)) => Some(stream),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => None,
+        Err(err) => panic!("接続を受け付けられなかった: {err}"),
+    })
+    .expect("状態の報告が届かなかった");
+    stream
+        .set_nonblocking(false)
+        .expect("接続を待てるようにできなかった");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("読み取りの上限を設定できなかった");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("書き込みの上限を設定できなかった");
+
+    let mut reader = BufReader::new(&stream);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("要求のヘッダーを読めなかった");
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().expect("本文の長さを読めなかった");
+        }
+    }
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .expect("要求の本文を読めなかった");
+    let report = serde_json::from_slice(&body).expect("本文が状態の報告ではない");
+    (report, stream)
+}
+
+fn acknowledge(mut stream: TcpStream) {
+    stream
+        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+        .expect("応答を返せなかった");
+}
+
+#[test]
+fn ウェブアプリに報告するときは_ctrl_cで最後の状態を送ってから止まる() {
+    let project = project();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("待ち受けを始められなかった");
+    listener
+        .set_nonblocking(true)
+        .expect("待ち受けの上限を設けられるようにできなかった");
+    let address = listener
+        .local_addr()
+        .expect("待ち受けのアドレスを得られなかった");
+    write(
+        &project.root.join("docs/private/factory/config.json"),
+        &format!(
+            r#"{{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {{"url": "http://{address}"}}}}"#
+        ),
+    );
+    let log = project.pid.with_file_name("start.log");
+    let mut running = Running(
+        start(&project)
+            .stdout(File::create(&log).expect("出力のファイルを作れなかった"))
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("korylusfactory start を起動できなかった"),
+    );
+    let timeout = Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
+    // セッションの実行中になる前に、ブランチの準備を終えた状態が届くこともある。
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "実行中の報告が届かなかった");
+        let (report, stream) = receive_report(&listener, remaining);
+        acknowledge(stream);
+        if report.running {
+            break;
+        }
+    }
+    until("セッションが起動しなかった", || {
+        fs::read_to_string(&project.pid).is_ok_and(|pid| pid.ends_with('\n'))
+    });
+    let session: u32 = fs::read_to_string(&project.pid)
+        .expect("セッションのPIDを読めなかった")
+        .trim()
+        .parse()
+        .expect("セッションのPIDを読み取れなかった");
+
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&running.0),
+        rustix::process::Signal::INT,
+    )
+    .expect("Ctrl+Cを送れなかった");
+    let (last, stream) = receive_report(&listener, timeout);
+    assert!(!last.running, "最後の報告がセッションの実行中のままだった");
+    assert_eq!(
+        last.progress.first().map(|plan| plan.name.as_str()),
+        Some("demo"),
+        "最後の報告に進めている作業計画書が無い"
+    );
+    let mut exit_status = || {
+        running
+            .0
+            .try_wait()
+            .expect("korylusfactory start の終了状態を読めなかった")
+    };
+    assert!(
+        wait_for(Duration::from_millis(300), &mut exit_status).is_none(),
+        "最後の報告に応答する前に終了した"
+    );
+    acknowledge(stream);
+    let status = wait_for(Duration::from_secs(5), exit_status)
+        .expect("最終報告に応答しても korylusfactory start が終了しなかった");
+    assert!(
+        status.success(),
+        "Ctrl+Cで取り消して終わらなかった: {status}\n{}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    until(
+        "止めたあとも、セッションが動き続けている",
+        || !alive(session),
     );
 }

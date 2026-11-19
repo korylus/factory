@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
@@ -24,6 +25,7 @@ use crate::branch::testutil::{Repo, git_run, repo_on, write_file};
 use crate::human_queue::{self, Listed, Location, Status};
 use crate::notify::{self, Message, Notifier};
 use crate::process::{self, Ended, Output, Session, System};
+use crate::web;
 
 /// 作業計画書のページ番号。
 const PLAN_PAGE: u64 = 20;
@@ -553,6 +555,7 @@ fn run_with(
         terminal,
         time_zone: &TimeZone::UTC,
         build,
+        web: &web::Link::system(),
         root,
         timing: Timing::default(),
     };
@@ -2563,4 +2566,240 @@ fn 作業報告書の確認の待ちで取り込まれていない知らせを�
         ],
         "知らせの通知に計画書名を渡していない"
     );
+}
+
+/// 送った状態の報告を記録し、決めたステータスを返す経路。
+struct Recorded {
+    status: u16,
+    reports: std::sync::Mutex<Vec<(String, korylusfactory_protocol::StatusReport)>>,
+    running: std::sync::mpsc::Sender<()>,
+}
+
+impl web::Transport for Recorded {
+    fn put(&self, url: &str, body: &[u8]) -> Result<u16, String> {
+        let report: korylusfactory_protocol::StatusReport =
+            serde_json::from_slice(body).expect("送った本文が状態の報告ではない");
+        let running = report.running;
+        self.reports
+            .lock()
+            .expect("送った報告を記録できなかった")
+            .push((url.to_owned(), report));
+        if running {
+            self.running
+                .send(())
+                .expect("実行中の報告を知らせられなかった");
+        }
+        Ok(self.status)
+    }
+}
+
+/// ウェブアプリを設定したプロジェクトで監督のループを動かし、送った報告・進捗と診断・届かなかったときの警告を返す。
+fn run_reporting(
+    status: u16,
+    sessions: impl FnOnce(&Wiki) -> Vec<Work<'_>>,
+    stop_after: usize,
+) -> (
+    Vec<(String, korylusfactory_protocol::StatusReport)>,
+    String,
+    Vec<String>,
+) {
+    let repo = repo_on("main");
+    let root = repo.root.as_path();
+    write_file(
+        root,
+        config::CONFIG_PATH,
+        br#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {"url": "https://factory.example.com/"}}"#,
+    );
+    let wiki = wiki(root);
+    let (running, started) = std::sync::mpsc::channel();
+    let work = sessions(&wiki)
+        .into_iter()
+        .map(|work| {
+            let started = &started;
+            Box::new(move |wiki: &Wiki| {
+                started
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("セッション中の報告を受け取れなかった");
+                work(wiki)
+            }) as Work<'_>
+        })
+        .collect();
+    let sessions = Sessions::new(&wiki, work);
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(stop_after, &cancel);
+    let transport = std::sync::Arc::new(Recorded {
+        status,
+        reports: std::sync::Mutex::new(Vec::new()),
+        running,
+    });
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warned = std::sync::Arc::clone(&warnings);
+    let link = web::Link {
+        transport: transport.clone(),
+        warn: std::sync::Arc::new(move |text: &str| {
+            warned
+                .lock()
+                .expect("警告を記録できなかった")
+                .push(text.to_owned());
+        }),
+        load_roadmap: std::sync::Arc::new(|_, _| Ok(Vec::new())),
+        interval: web::INTERVAL,
+    };
+    let build = build();
+    let start = Start {
+        runner: &wiki,
+        launcher: &sessions,
+        clock: &clock,
+        queues: &NoQueue,
+        notifier: &NoQueue,
+        terminal: false,
+        time_zone: &TimeZone::UTC,
+        build: &build,
+        web: &link,
+        root,
+        timing: Timing::default(),
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run(&start, &mut out, &mut err, clock.cancel).expect("監督のループがエラーで終わった");
+    let reports = transport
+        .reports
+        .lock()
+        .expect("送った報告を読めなかった")
+        .clone();
+    let warnings = warnings.lock().expect("警告を読めなかった").clone();
+    (
+        reports,
+        format!(
+            "{}{}",
+            String::from_utf8(out).expect("進捗がUTF-8ではない"),
+            String::from_utf8(err).expect("診断がUTF-8ではない")
+        ),
+        warnings,
+    )
+}
+
+#[test]
+fn ウェブアプリを設定するとセッションの前後の状態の報告を送る() {
+    let (reports, out, warnings) = run_reporting(
+        204,
+        |_| {
+            vec![Box::new(|_: &Wiki| {
+                Some(json!({"needs_human": "設計を変えてよいか", "verification": []}))
+            })]
+        },
+        2,
+    );
+
+    assert!(
+        reports
+            .iter()
+            .all(|(url, _)| url == "https://factory.example.com/api/v1/director/status"),
+        "送り先が違う: {reports:?}"
+    );
+    let running = reports
+        .iter()
+        .find(|(_, report)| report.running)
+        .map(|(_, report)| report)
+        .expect("セッションを始める前の報告を送っていない");
+    let plan = &running.progress[0];
+    assert_eq!(plan.name, "demo", "進行中の作業計画書の名前が違う:\n{out}");
+    assert_eq!(plan.task.as_deref(), Some("1-1"), "進めているタスクが違う");
+    assert_eq!(
+        plan.step.as_ref().map(|step| step.label.as_str()),
+        Some("実装"),
+        "進めているステップが違う"
+    );
+    let tasks: Vec<(&str, korylusfactory_protocol::TaskStatus)> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.number.as_str(), task.status))
+        .collect();
+    assert_eq!(
+        tasks,
+        [
+            ("1-1", korylusfactory_protocol::TaskStatus::InProgress),
+            ("1-2", korylusfactory_protocol::TaskStatus::Pending)
+        ],
+        "タスクの一覧が違う"
+    );
+    let (_, last) = reports.last().expect("報告を送っていない");
+    assert!(!last.running, "セッションのあとの報告を実行中のまま送った");
+    assert_eq!(
+        last.progress[0]
+            .wait
+            .as_ref()
+            .map(|wait| wait.label.as_str()),
+        Some("セッションからの質問"),
+        "人間待ちを報告していない"
+    );
+    assert!(
+        last.upcoming.is_empty(),
+        "進行中の作業計画書をこれから進めるものとして送った: {:?}",
+        last.upcoming
+    );
+    assert!(warnings.is_empty(), "届いたのに警告を出した: {warnings:?}");
+}
+
+#[test]
+fn ウェブアプリが受け付けなくても作業計画書を進め_警告を1回だけ出す() {
+    let (reports, out, warnings) = run_reporting(
+        503,
+        |_| {
+            vec![Box::new(|_: &Wiki| {
+                Some(json!({"needs_human": "設計を変えてよいか", "verification": []}))
+            })]
+        },
+        2,
+    );
+
+    assert!(reports.len() >= 2, "報告を送り続けていない: {reports:?}");
+    assert!(
+        out.contains("demo: 人間を待っています (セッションからの質問)"),
+        "ウェブアプリに届かないと作業計画書を進めなかった:\n{out}"
+    );
+    assert_eq!(
+        warnings,
+        [
+            "ウェブアプリが状態の報告を受け付けませんでした (ステータス 503)。作業計画書は進め続けます"
+        ],
+        "警告の出し方が違う"
+    );
+}
+
+#[test]
+fn 取り消してあれば本物の時計は待たずに戻る() {
+    let cancel = AtomicBool::new(true);
+
+    SystemClock::new(&cancel).sleep_with(Duration::from_mins(10), |_| {
+        panic!("取り消してあるのに待機を始めた");
+    });
+}
+
+#[test]
+fn 待機中に別のスレッドで取り消すと時計の待ちが終わる() {
+    let cancel = AtomicBool::new(false);
+    let timeout = Duration::from_secs(5);
+
+    std::thread::scope(|scope| {
+        let (waiting, entered) = mpsc::channel();
+        let (cancelled, resume) = mpsc::channel();
+        let cancel = &cancel;
+        scope.spawn(move || {
+            entered.recv_timeout(timeout).expect("待機を始めなかった");
+            cancel.store(true, Ordering::SeqCst);
+            cancelled.send(()).expect("取り消しを知らせられなかった");
+        });
+
+        let mut waited = false;
+        SystemClock::new(cancel).sleep_with(Duration::from_mins(10), |_| {
+            assert!(!waited, "取り消しを確認せずに次の待機に入った");
+            waited = true;
+            waiting.send(()).expect("待機の開始を知らせられなかった");
+            resume
+                .recv_timeout(timeout)
+                .expect("取り消しの通知が届かなかった");
+        });
+        assert!(waited, "待機に入る前に戻った");
+    });
 }

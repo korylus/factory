@@ -1,12 +1,11 @@
-<!-- last_synced: 2026-11-18 -->
+<!-- last_synced: 2026-11-19 -->
 
 # Korylus Factory
 
 > 日本語 | [English](./README.en.md)
 
 Korylus Factoryは、Korylusのプロジェクトの作業計画書を、人が付き添わずに進めるためのツールです。
-今は、作業計画書を進めるCLIの `korylusfactory` があります。
-進み具合を見るウェブアプリは、これから足します。
+作業計画書を進めるCLIの `korylusfactory` と、各プロジェクトの進み具合を見る管制のウェブアプリの `korylusfactory-web` があります。
 
 Korylusのプロジェクトで共通に使う開発ツール (koryluslint・korylusflow) は、[korylus/tools](https://github.com/korylus/tools) にあります。
 korylusfactoryは、korylusflowと同じ作業計画書・レビュードキュメント・作業報告書の形を使います。
@@ -34,6 +33,7 @@ korylusfactory --version
 
 プロジェクトのルートの `docs/private/factory/config.json` に、ロードマップのURLと、承認とみなす節・完了とみなす節を書きます。
 人間キューと人間待ちの知らせを使うときは、プロジェクト名・人間キューの置き場・通知のコマンドも書きます。
+管制のウェブアプリに状態を送るときは、そのURLも書きます。
 
 ```json
 {
@@ -42,7 +42,8 @@ korylusfactory --version
   "done_sections": ["リリース待ち", "やった"],
   "project": "<プロジェクト名>",
   "queue": { "space": "<スペース>", "topic": 12 },
-  "notify": { "command": ["<通知のコマンド>", "<引数>"] }
+  "notify": { "command": ["<通知のコマンド>", "<引数>"] },
+  "web": { "url": "https://<管制のウェブアプリ>" }
 }
 ```
 
@@ -54,6 +55,7 @@ korylusfactory --version
 | `project`       | プロジェクト名。英数字・ハイフン・アンダースコアで書きます。人間キューの項目と通知のコマンドに渡します。`queue` か `notify` を書くときは必須です |
 | `queue`         | 人間キューの置き場 (`space`: スペースの識別子、`topic`: トピックの番号)。省略すると項目を積まず、`resume` だけで再開します                       |
 | `notify`        | 人間待ちを知らせるコマンド (`command`: コマンドと引数の配列)。シェルを通さずに実行します。省略すると知らせません                                 |
+| `web`           | 状態を送る管制のウェブアプリ (`url`: ウェブアプリのURL)。状態ファイルを書いたあとと1分ごとに送ります。省略すると送りません                       |
 
 書いた節がロードマップに無いとき、承認とみなす節と完了とみなす節が重なるとき、知らない項目があるときは、書き誤りとしてエラーにします。
 
@@ -107,6 +109,10 @@ pushとPRの作成・マージは、指示で禁じるのに加えて、次で�
 実行中のセッションは、セッションが起動した子プロセスまで終わらせます。
 状態はセッションの結果を記録する前のまま残り、次に起動すると、中断したことを指示に添えて同じステップをやり直します。
 止めたセッションを終わらせ切るまでは、次の `start` を起動できません。
+
+設定ファイルに `web` を書いたプロジェクトでは、1回目のCtrl-Cを受けると、最後の状態の送信処理が終わるまで待ちます。
+送信に失敗した場合も終了します。標準エラーへの警告は、送信が回復するまで理由ごとに1回出します。
+送り終えるのを待たずに止めるときは、もう一度Ctrl-Cを押します。
 
 ### 人間待ちと `resume`
 
@@ -307,6 +313,154 @@ korylusfactoryのバージョンと、これから進める作業計画書の並
 `--version` は、バージョン番号・ビルド元のコミット・ビルドした日と、ビルド元のリポジトリの場所を表示します。
 `-V` は、ビルド元のリポジトリの場所を省いて1行で表示します。
 
+## 管制のウェブアプリ
+
+`korylusfactory-web` は、各プロジェクトで動く `korylusfactory start` が送る状態を受け取り、プロジェクトの一覧と各プロジェクトの画面で見せるウェブアプリです (Rust)。
+どのプロジェクトが人間待ちか、どれが進んでいるかを、スマートフォンやPCのブラウザから確かめられます。
+開いたままの画面は、新しい状態を受け取ると読み込み直さずに変わります。
+5分を超えて状態が届いていないプロジェクトは「不通」と出します。
+
+ウェブアプリは、exe.devの管制のVMで、認証付きのプロキシの内側だけで動かします。
+人間とディレクター (各プロジェクトの `korylusfactory start`) は、exe.devのプロキシが付けるヘッダーで見分けます。
+
+| 主           | 見分け方                                                                                                        | 使えるもの          |
+| ------------ | --------------------------------------------------------------------------------------------------------------- | ------------------- |
+| 人間         | `X-Exedev-Source-Vm` ヘッダーがなく、ログインした人のメールアドレス (`X-ExeDev-Email`) が設定の `owners` にある | 画面                |
+| ディレクター | peer連携で呼んだVMの名前 (`X-Exedev-Source-Vm`) が、設定の `directors` にある                                   | 状態の報告のAPIだけ |
+
+各プロジェクトのVMには、ウェブアプリを呼ぶための秘密情報を置きません。
+peer連携の鍵はexe.devが持ち、呼び出し元のVMの名前はexe.devが付け直すため、偽れません。
+
+### 管制のVMに入れる
+
+exe.devで管制のVMを作ります。
+手順1から3はSSHで入った管制のVMで、手順4は手元の端末で進めます。
+設定ファイルとDBのパスは、systemdのユーザーマネージャーでXDGの既定値を使う場合の例です。
+
+1. 「[インストール](#インストール)」と同じく、mise・Make・Cコンパイラを用意して `korylus/factory` のリポジトリを置き、ルートでウェブアプリをビルドします
+
+   ```sh
+   mise install
+   mise exec -- make install-korylusfactory-web
+   ```
+
+   `~/.local/bin/korylusfactory-web` に置きます (`BINDIR=<ディレクトリ>` で置き場所を変えられます)。
+
+2. 設定ファイルの見本を写し、画面を見る人のメールアドレス・ディレクターのVMとプロジェクトの対応・DBのパスを書き換えます
+
+   ```sh
+   mkdir -p ~/.config/korylusfactory-web
+   cp crates/korylusfactory-web/deploy/config.example.json ~/.config/korylusfactory-web/config.json
+   ```
+
+   | 項目        | 内容                                                                                                                 |
+   | ----------- | -------------------------------------------------------------------------------------------------------------------- |
+   | `listen`    | 待ち受けるアドレス。省略すると `0.0.0.0:8000` で待ち受けます                                                         |
+   | `database`  | SQLiteのDBファイルの絶対パス。既定の置き場は `~/.local/state/korylusfactory-web/factory.sqlite3`                     |
+   | `owners`    | 画面を見られる人の、exe.devでログインするメールアドレス。1つ以上書きます                                             |
+   | `directors` | 状態を送れるVM (`vm`) と、そのプロジェクトの名前 (`project`)。プロジェクトは要求の本文ではなく、ここの対応で決めます |
+
+   `database` には `~` を実際のホームのパスに展開して書きます。
+   ユーザーマネージャーに `XDG_CONFIG_HOME` を設定している場合は、ユニットの `%E` がそのディレクトリを指します。
+   設定ファイルをその下の `korylusfactory-web/config.json` に、次の手順で写すユニットを `systemd/user/` に置きます。
+   `XDG_STATE_HOME` を設定している場合は、ユニットの `StateDirectory` がその下に `korylusfactory-web` を作ります。
+   `database` には、そのディレクトリの `factory.sqlite3` の実際の絶対パスを書きます。
+
+3. systemdのユーザーのユニットの見本を写し、ログインしていない間も動かし続けるようにして起動します
+
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   cp crates/korylusfactory-web/deploy/korylusfactory-web.service ~/.config/systemd/user/
+   ```
+
+   `BINDIR` を指定してインストールした場合は、起動する前にコピーしたユニットの `ExecStart` の先頭を、インストールした `korylusfactory-web` の絶対パスに書き換えます。
+
+   ```sh
+   sudo loginctl enable-linger "$USER"
+   systemctl --user daemon-reload
+   systemctl --user enable --now korylusfactory-web
+   ```
+
+   ユニットはDBの置き場を作ってから起動します。
+   動いているかは `systemctl --user status korylusfactory-web`、出力は `journalctl --user -u korylusfactory-web` で確かめます。
+
+   失敗すると、5秒空けて起動し直します。
+   最初の起動を含め、1分間に5回までです。
+   上限に達したら、原因を直してから起動回数をリセットし、起動します。
+
+   ```sh
+   systemctl --user reset-failed korylusfactory-web
+   systemctl --user start korylusfactory-web
+   ```
+
+4. exe.devに登録したSSH鍵で、手元の端末からプロキシのポートを設定します
+
+   `control_vm` を管制のVM名に、`control_port` を管制の設定の `listen` のポートに置き換えます (`listen` を省略した場合は8000)。
+
+   ```sh
+   control_vm=factory-control
+   control_port=8000
+   ssh exe.dev share port "$control_vm" "$control_port"
+   ```
+
+   プロキシはprivateのままにします。
+   画面を見る人には、アプリの `owners` への登録と、exe.devのVMへのWebアクセス権の両方が必要です。
+   Webアクセス権をまだ持っていない人には、手元の端末でその人のログイン用メールアドレスを指定して付与します。
+
+   ```sh
+   viewer_email=viewer@example.com
+   ssh exe.dev share add "$control_vm" "$viewer_email"
+   ```
+
+   ブラウザで `https://<管制のVM>.exe.xyz/` を開き、exe.devにログインするとプロジェクトの一覧が出ます。
+
+### 各プロジェクトから状態を送る
+
+プロジェクトごとに、次を設定します。
+
+1. exe.devに登録したSSH鍵で、手元の端末からプロジェクトのVMと管制のVMのpeer連携を足します
+
+   VM名と連携名を置き換え、`control_port` には手順4で `share port` に指定したポートを使います。
+
+   ```sh
+   control_vm=factory-control
+   control_port=8000
+   project_vm=annict-factory
+   integration_name=annict-control
+   ssh exe.dev integrations add http-proxy \
+     --name "$integration_name" \
+     --target "https://${control_vm}.exe.xyz:${control_port}/" \
+     --peer --attach "vm:$project_vm"
+   ```
+
+   プロジェクトのVMからは、`https://<連携の名前>.int.exe.xyz/` で管制のVMのウェブアプリを呼べます。
+
+2. 管制のVMの設定ファイルの `directors` に、プロジェクトのVMの名前とプロジェクトの名前を足し、`systemctl --user restart korylusfactory-web` で読み直させます
+3. プロジェクトの設定ファイル (「[設定ファイル](#設定ファイル)」) の `web` に、連携のURLを書きます
+
+   ```json
+   {
+     "web": { "url": "https://<連携の名前>.int.exe.xyz" }
+   }
+   ```
+
+4. プロジェクトのVMで `korylusfactory` を入れ直し (「[インストール](#インストール)」)、`korylusfactory start` を起動し直します
+
+届かないときは、`korylusfactory start` が標準エラーに理由を出して、作業計画書を進め続けます。
+
+### 入れ直す
+
+管制のVMでリポジトリを新しくし、同じコマンドでビルドしてから起動し直します。
+インストール時に `BINDIR` を指定した場合は、同じ `BINDIR` を指定します。
+
+```sh
+mise exec -- make install-korylusfactory-web
+systemctl --user restart korylusfactory-web
+```
+
+受け取った状態はDBに残るため、起動し直しても最後に受け取った状態をそのまま見せます。
+ウェブアプリは、SIGTERMを受けると、開いている画面への知らせを閉じてから止まります。
+
 ## インストール
 
 korylusfactoryは、作業計画書を進めるときに、git・`wikino` コマンド・Claude Code・Codexを起動します。
@@ -331,18 +485,22 @@ mise exec -- make install-korylusfactory
 ## 開発
 
 Cargoのワークスペース (`crates/`) に、次のクレートを置いています。
-依存は一方向で、表の上のクレートがすぐ下のクレートに依存します。
+`korylusfactory-cli` から `korylus-workdoc` までの依存は一方向で、表の上のクレートがすぐ下のクレートに依存します。
+`korylusfactory-cli` と `korylusfactory-web` は、状態の報告の型を `korylusfactory-protocol` から使います。
+`korylusfactory-web` は、`korylusfactory-protocol` だけに依存します。
 
-| クレート              | 役割                                                                                                       |
-| --------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `korylusfactory-cli`  | コマンドの引数の解釈と、外部プロセス (git・wikino・Claude Code・Codex・通知のコマンド) の起動              |
-| `korylusfactory-core` | 進める作業計画書の判定・状態ファイルの読み書き・タスクを進める状態遷移                                     |
-| `korylus-workdoc`     | 作業ドキュメント (作業計画書・レビュードキュメント・ロードマップ) の読み取りと、人間キューの項目の読み書き |
+| クレート                  | 役割                                                                                                       |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `korylusfactory-cli`      | コマンドの引数の解釈と、外部プロセス (git・wikino・Claude Code・Codex・通知のコマンド) の起動              |
+| `korylusfactory-core`     | 進める作業計画書の判定・状態ファイルの読み書き・タスクを進める状態遷移                                     |
+| `korylus-workdoc`         | 作業ドキュメント (作業計画書・レビュードキュメント・ロードマップ) の読み取りと、人間キューの項目の読み書き |
+| `korylusfactory-web`      | 各プロジェクトの状態を一覧で見せる管制のウェブアプリ (HTTPのサーバー・認証・SQLite・画面)                  |
+| `korylusfactory-protocol` | `korylusfactory start` とウェブアプリがやり取りする状態の報告の型                                          |
 
 外部プロセスの起動は `korylusfactory-cli` に閉じ、`korylusfactory-core` と `korylus-workdoc` からは起動しません。
 
 ツールの版は `mise.toml` で持ちます。
-Markdownなどの整形に使うOxfmtは、`korylus/factory` のリポジトリのルートでpnpmを使って入れます。
+Markdownなどの整形に使うOxfmtと、ウェブアプリのCSSとJavaScriptを作るツール (Tailwind CSS・Basecoat・htmx) は、`korylus/factory` のリポジトリのルートでpnpmを使って入れます。
 
 ```sh
 mise install
@@ -350,11 +508,21 @@ mise exec -- pnpm install
 ```
 
 ```sh
-mise exec -- make install-korylusfactory  # korylusfactoryをビルド (~/.local/bin/korylusfactory)
-mise exec -- make test                    # テストを実行
-mise exec -- make lint                    # clippyを実行
-mise exec -- make fmt                     # rustfmt + Oxfmtでフォーマット
-mise exec -- make fmt-check               # フォーマットチェック
+mise exec -- make install-korylusfactory      # korylusfactoryをビルド (~/.local/bin/korylusfactory)
+mise exec -- make install-korylusfactory-web  # ウェブアプリをビルド (~/.local/bin/korylusfactory-web)
+mise exec -- make test                        # テストを実行 (Rustと、トークンを生成するスクリプト)
+mise exec -- make lint                        # clippyを実行
+mise exec -- make fmt                         # rustfmt + Oxfmtでフォーマット
+mise exec -- make fmt-check                   # フォーマットチェック
+mise exec -- make dev-web                     # ウェブアプリを開発用の設定で起動
+mise exec -- make web-assets                  # ウェブアプリのCSSとJavaScriptを作り直す
 ```
 
-CIでは、`main` へのpushとPull Requestで `make fmt-check`・`make lint`・`make test` を実行します。
+`make dev-web` は `crates/korylusfactory-web/config.dev.json` の設定で、8080番で待ち受けます。
+開発環境にはexe.devのプロキシが無いため、すべての要求を設定に書いた開発用の身元からのものとみなします。
+
+ウェブアプリは、`crates/korylusfactory-web/static/` のCSSとJavaScriptを実行ファイルに埋め込みます。
+テンプレート (`templates/`)・トークン (`assets/tokens.json`)・`assets/` のCSSを変えたら、`make web-assets` で作り直し、`static/` と `assets/tokens.css` の変更も一緒にコミットします。
+
+CIでは、`main` へのpushとPull Requestで `make web-assets-check`・`make fmt-check`・`make lint`・`make test` を実行します。
+`make web-assets-check` は、作り直したCSSとJavaScriptがコミットしたものと食い違うと失敗します。

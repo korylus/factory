@@ -334,6 +334,7 @@ mod tests {
             sections: vec!["やってる".to_owned(), "優先度: 高".to_owned()],
             done_sections: vec!["やった".to_owned()],
             project: None,
+            web: None,
         }
     }
 

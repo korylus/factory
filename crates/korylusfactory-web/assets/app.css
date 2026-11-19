@@ -1,0 +1,11 @@
+/* ウェブアプリのスタイルシートの入り口。`make web-assets` で static/app.css を作る。
+
+   Tailwindが読み取るのはテンプレートだけにする。
+   既定の自動検出ではリポジトリ全体 (Rustのコードや作業ドキュメント) を読み取り、画面と関係の無い語でもCSSが変わるため。
+
+   BasecoatはTailwindの直後に読み込み、その後に読み込む tokens.css がBasecoatの既定の変数を上書きする。 */
+@import "tailwindcss" source(none);
+@source "../templates";
+@import "basecoat-css/vega";
+@import "./tokens.css";
+@import "./factory.css";

@@ -1,0 +1,7 @@
+{
+  "listen": "0.0.0.0:8080",
+  "database": "tmp/korylusfactory-web.sqlite3",
+  "owners": ["owner@example.com"],
+  "directors": [{ "vm": "example-factory", "project": "Example" }],
+  "dev_identity": { "email": "owner@example.com" }
+}

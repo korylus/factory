@@ -1,12 +1,11 @@
-<!-- last_synced: 2026-11-18 -->
+<!-- last_synced: 2026-11-19 -->
 
 # Korylus Factory
 
 > [日本語](./README.md) | English
 
 Korylus Factory is a tool for advancing the work plans of the Korylus projects without a person attending to them.
-It currently provides `korylusfactory`, a CLI that advances work plans.
-A web app for viewing progress will be added later.
+It provides `korylusfactory`, a CLI that advances work plans, and `korylusfactory-web`, a control web app for viewing the progress of each project.
 
 The development tools shared across the Korylus projects (koryluslint and korylusflow) live in [korylus/tools](https://github.com/korylus/tools).
 korylusfactory uses the same formats for work plans, review documents, and work reports as korylusflow.
@@ -36,6 +35,7 @@ Run every subcommand at the project root.
 
 Write the roadmap URL and the roadmap sections that count as approved and as done in `docs/private/factory/config.json` at the project root.
 To use the human queue and the notifications of human waits, also write the project name, where the human queue lives, and the notification command.
+To send the state to the control web app, also write its URL.
 
 ```json
 {
@@ -44,7 +44,8 @@ To use the human queue and the notifications of human waits, also write the proj
   "done_sections": ["リリース待ち", "やった"],
   "project": "<project name>",
   "queue": { "space": "<space>", "topic": 12 },
-  "notify": { "command": ["<notification command>", "<argument>"] }
+  "notify": { "command": ["<notification command>", "<argument>"] },
+  "web": { "url": "https://<control web app>" }
 }
 ```
 
@@ -56,6 +57,7 @@ To use the human queue and the notifications of human waits, also write the proj
 | `project`       | The project name, written with letters, digits, hyphens, and underscores. It is passed to human queue items and the notification command. Required when `queue` or `notify` is written |
 | `queue`         | Where the human queue lives (`space`: the space identifier, `topic`: the topic number). When omitted, no items are added and plans are resumed only with `resume`                      |
 | `notify`        | The command that announces human waits (`command`: an array of the command and its arguments), run without a shell. When omitted, nothing is announced                                 |
+| `web`           | The control web app to send the state to (`url`: the web app's URL). The state is sent after writing a state file and every minute. When omitted, nothing is sent                      |
 
 A section missing from the roadmap, a section listed as both approved and done, or an unknown field is treated as a mistake and reported as an error.
 
@@ -109,6 +111,10 @@ Stop `start` with a signal such as Ctrl-C.
 The running session is ended, down to the child processes the session started.
 The state stays as it was before the session's result was recorded, and the next run redoes the same step, telling the session that it was interrupted.
 Until the stopped session has been fully ended, the next `start` cannot run.
+
+In a project whose settings file has `web`, `start` waits for the final state report's HTTP request to finish after the first Ctrl-C.
+`start` still exits if the request fails. It writes each failure reason to standard error once until a report succeeds.
+To stop without waiting for the send to finish, press Ctrl-C again.
 
 ### Human waits and `resume`
 
@@ -309,6 +315,155 @@ The per-task records use the same field names as `tasks` in [korylusflow](https:
 `--version` shows the version number, the commit it was built from, the build date, and the location of the repository it was built from.
 `-V` shows the same on one line, without the repository location.
 
+## Control web app
+
+`korylusfactory-web` is a web app (written in Rust) that receives the state sent by `korylusfactory start` running in each project, and shows it in a list of projects and a page for each project.
+You can check from a phone or PC browser which projects are waiting for a human and which are progressing.
+A page left open changes without reloading when new state arrives.
+Projects whose state has not arrived for more than 5 minutes are shown as 「不通」 (unreachable).
+
+The web app runs on a control VM on exe.dev, only behind its authenticating proxy.
+Humans and directors (`korylusfactory start` in each project) are told apart by the headers the exe.dev proxy attaches.
+
+| Principal | How it is identified                                                                                                       | What it can use              |
+| --------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| Human     | The request has no `X-Exedev-Source-Vm` header, and the signed-in person's email address (`X-ExeDev-Email`) is in `owners` | The pages                    |
+| Director  | The name of the VM calling through a peer integration (`X-Exedev-Source-Vm`) is listed in `directors`                      | Only the state reporting API |
+
+No secret for calling the web app is placed on the project VMs.
+exe.dev holds the key of the peer integration and resets the calling VM's name, so it cannot be forged.
+
+### Installing on the control VM
+
+Create the control VM on exe.dev.
+Connect to it with SSH for steps 1–3, then run step 4 from your local terminal.
+The configuration and database paths below use the XDG defaults of the systemd user manager.
+
+1. As in "[Installing](#installing)", prepare mise, Make, and a C compiler, put the `korylus/factory` repository in place, and build the web app at its root
+
+   ```sh
+   mise install
+   mise exec -- make install-korylusfactory-web
+   ```
+
+   It is placed at `~/.local/bin/korylusfactory-web` (change the location with `BINDIR=<directory>`).
+
+2. Copy the sample configuration file, and fill in the email addresses of the people who view the pages, the mapping from director VMs to projects, and the database path
+
+   ```sh
+   mkdir -p ~/.config/korylusfactory-web
+   cp crates/korylusfactory-web/deploy/config.example.json ~/.config/korylusfactory-web/config.json
+   ```
+
+   | Field       | Description                                                                                                                                     |
+   | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `listen`    | The address to listen on. Defaults to `0.0.0.0:8000`                                                                                            |
+   | `database`  | The absolute path of the SQLite database file. The default location is `~/.local/state/korylusfactory-web/factory.sqlite3`                      |
+   | `owners`    | The email addresses, used to log in to exe.dev, of the people who can view the pages. Write at least one                                        |
+   | `directors` | The VMs that can send state (`vm`) and the names of their projects (`project`). The project is decided by this mapping, not by the request body |
+
+   In `database`, expand `~` to the actual path of your home directory.
+   If the user manager has `XDG_CONFIG_HOME` set, `%E` in the unit points to that directory.
+   Place the configuration file in `korylusfactory-web/config.json` and the unit from the next step in `systemd/user/` under that directory.
+   If it has `XDG_STATE_HOME` set, `StateDirectory` creates `korylusfactory-web` under that directory.
+   Set `database` to the actual absolute path of `factory.sqlite3` in the resulting directory.
+
+3. Copy the sample systemd user unit, keep it running while you are logged out, and start it
+
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   cp crates/korylusfactory-web/deploy/korylusfactory-web.service ~/.config/systemd/user/
+   ```
+
+   If you installed with `BINDIR`, edit the copied unit before starting it.
+   Set the first part of `ExecStart` to the absolute path of the installed `korylusfactory-web` executable.
+
+   ```sh
+   sudo loginctl enable-linger "$USER"
+   systemctl --user daemon-reload
+   systemctl --user enable --now korylusfactory-web
+   ```
+
+   The unit creates the database directory before starting.
+   Check that it is running with `systemctl --user status korylusfactory-web`, and its output with `journalctl --user -u korylusfactory-web`.
+
+   After a failure, the unit waits five seconds before restarting.
+   It allows five starts per minute, including the initial start.
+   If it reaches the limit, fix the cause, reset the counter, and start the unit again.
+
+   ```sh
+   systemctl --user reset-failed korylusfactory-web
+   systemctl --user start korylusfactory-web
+   ```
+
+4. From your local terminal, use an SSH key registered with exe.dev to set the proxy port
+
+   Replace `control_vm` with the control VM name and set `control_port` to the port in the control VM's `listen` setting (8000 if you omitted `listen`).
+
+   ```sh
+   control_vm=factory-control
+   control_port=8000
+   ssh exe.dev share port "$control_vm" "$control_port"
+   ```
+
+   Keep the proxy private.
+   Viewers need both an entry in the app's `owners` and Web access to the exe.dev VM.
+   If someone still needs Web access, grant it from your local terminal using the email address they use to sign in.
+
+   ```sh
+   viewer_email=viewer@example.com
+   ssh exe.dev share add "$control_vm" "$viewer_email"
+   ```
+
+   Open `https://<control VM>.exe.xyz/` in a browser and log in to exe.dev to see the list of projects.
+
+### Sending state from each project
+
+Set up the following for each project.
+
+1. From your local terminal, use an SSH key registered with exe.dev to add a peer integration from the project VM to the control VM
+
+   Replace the VM and integration names, and set `control_port` to the port passed to `share port` in step 4.
+
+   ```sh
+   control_vm=factory-control
+   control_port=8000
+   project_vm=annict-factory
+   integration_name=annict-control
+   ssh exe.dev integrations add http-proxy \
+     --name "$integration_name" \
+     --target "https://${control_vm}.exe.xyz:${control_port}/" \
+     --peer --attach "vm:$project_vm"
+   ```
+
+   From the project VM, the web app on the control VM can be called at `https://<integration name>.int.exe.xyz/`.
+
+2. Add the project VM's name and the project's name to `directors` in the control VM's configuration file, and reload it with `systemctl --user restart korylusfactory-web`
+3. Write the integration URL in `web` of the project's configuration file ("[Configuration file](#configuration-file)")
+
+   ```json
+   {
+     "web": { "url": "https://<integration name>.int.exe.xyz" }
+   }
+   ```
+
+4. On the project VM, reinstall `korylusfactory` ("[Installing](#installing)") and restart `korylusfactory start`
+
+When the state cannot be delivered, `korylusfactory start` prints the reason to standard error and keeps advancing the work plans.
+
+### Reinstalling
+
+On the control VM, update the repository, build with the same command, and restart.
+If you set `BINDIR` when installing, use the same `BINDIR` again.
+
+```sh
+mise exec -- make install-korylusfactory-web
+systemctl --user restart korylusfactory-web
+```
+
+The received state is kept in the database, so the last received state is shown as-is after a restart.
+On SIGTERM, the web app closes the notifications to open pages and then stops.
+
 ## Installing
 
 While advancing work plans, korylusfactory launches git, the `wikino` command, Claude Code, and Codex.
@@ -333,18 +488,22 @@ When the outdated warning appears (see "[Warning when outdated](#warning-when-ou
 ## Development
 
 The Cargo workspace (`crates/`) contains the following crates.
-Dependencies go in one direction: each crate in the table depends on the crate right below it.
+From `korylusfactory-cli` to `korylus-workdoc`, dependencies go in one direction: each crate in the table depends on the crate right below it.
+`korylusfactory-cli` and `korylusfactory-web` use the types of the state report from `korylusfactory-protocol`.
+`korylusfactory-web` depends only on `korylusfactory-protocol`.
 
-| Crate                 | Role                                                                                                                   |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `korylusfactory-cli`  | Parsing command arguments and launching external processes (git, wikino, Claude Code, Codex, the notification command) |
-| `korylusfactory-core` | Deciding which work plan to advance, reading and writing state files, and the state transitions that advance tasks     |
-| `korylus-workdoc`     | Reading work documents (work plans, review documents, the roadmap) and reading and writing human queue items           |
+| Crate                     | Role                                                                                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `korylusfactory-cli`      | Parsing command arguments and launching external processes (git, wikino, Claude Code, Codex, the notification command) |
+| `korylusfactory-core`     | Deciding which work plan to advance, reading and writing state files, and the state transitions that advance tasks     |
+| `korylus-workdoc`         | Reading work documents (work plans, review documents, the roadmap) and reading and writing human queue items           |
+| `korylusfactory-web`      | The control web app that lists the state of each project (HTTP server, authentication, SQLite, screens)                |
+| `korylusfactory-protocol` | The types of the state reports that `korylusfactory start` and the web app exchange                                    |
 
 External processes are launched only from `korylusfactory-cli`, never from `korylusfactory-core` or `korylus-workdoc`.
 
 Tool versions are kept in `mise.toml`.
-From the root of the `korylus/factory` repository, use pnpm to install Oxfmt, which formats Markdown and other files.
+From the root of the `korylus/factory` repository, use pnpm to install Oxfmt, which formats Markdown and other files, and the tools that build the web app's CSS and JavaScript (Tailwind CSS, Basecoat, htmx).
 
 ```sh
 mise install
@@ -352,11 +511,21 @@ mise exec -- pnpm install
 ```
 
 ```sh
-mise exec -- make install-korylusfactory  # build korylusfactory (to ~/.local/bin/korylusfactory)
-mise exec -- make test                    # run the tests
-mise exec -- make lint                    # run clippy
-mise exec -- make fmt                     # format with rustfmt + Oxfmt
-mise exec -- make fmt-check               # check formatting
+mise exec -- make install-korylusfactory      # build korylusfactory (to ~/.local/bin/korylusfactory)
+mise exec -- make install-korylusfactory-web  # build the web app (to ~/.local/bin/korylusfactory-web)
+mise exec -- make test                        # run the tests (Rust and the token generation script)
+mise exec -- make lint                        # run clippy
+mise exec -- make fmt                         # format with rustfmt + Oxfmt
+mise exec -- make fmt-check                   # check formatting
+mise exec -- make dev-web                     # start the web app with the development settings
+mise exec -- make web-assets                  # rebuild the web app's CSS and JavaScript
 ```
 
-CI runs `make fmt-check`, `make lint`, and `make test` on pushes to `main` and on pull requests.
+`make dev-web` uses the settings in `crates/korylusfactory-web/config.dev.json` and listens on port 8080.
+Because the development environment has no exe.dev proxy, it treats every request as coming from the development identity written in the settings.
+
+The web app embeds the CSS and JavaScript in `crates/korylusfactory-web/static/` into the executable.
+When you change the templates (`templates/`), the tokens (`assets/tokens.json`), or the CSS in `assets/`, rebuild them with `make web-assets` and commit the changes to `static/` and `assets/tokens.css` along with them.
+
+CI runs `make web-assets-check`, `make fmt-check`, `make lint`, and `make test` on pushes to `main` and on pull requests.
+`make web-assets-check` fails when the rebuilt CSS and JavaScript differ from the committed files.

@@ -17,6 +17,7 @@ pub mod source;
 pub mod start;
 pub mod status;
 pub mod version;
+pub mod web;
 
 /// エラーerrのメッセージに、理由を順に添える。
 pub fn describe(err: &dyn std::error::Error) -> String {
