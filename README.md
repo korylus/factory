@@ -518,6 +518,20 @@ mise exec -- make dev-web                     # ウェブアプリを開発用�
 mise exec -- make web-assets                  # ウェブアプリのCSSとJavaScriptを作り直す
 ```
 
+リポジトリの直下の `.cargo/config.toml` で、`cargo add` と `cargo update` が公開から3日経っていない版を選ばないようにしています。
+`--locked` を付けたビルド・リント・テスト (`make` の各ターゲットとCI) は、`Cargo.lock` に3日経っていない版があっても通ります。
+脆弱性の修正版のように、3日経っていない版をあえて使うときは、クレートを1つずつ指定して上げます。
+
+```sh
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <クレート> --precise <バージョン>
+```
+
+このコマンドでは、指定したクレートの推移的な依存にも、公開から3日経っていない版が入ることがあります。
+更新後は `Cargo.lock` の差分を確認してください。
+
+上げた版が3日経つまでは、クレートを指定せずに `cargo update` を実行しないでください。
+3日経った版に戻ることがあります。
+
 `make dev-web` は `crates/korylusfactory-web/config.dev.json` の設定で、8080番で待ち受けます。
 開発環境にはexe.devのプロキシが無いため、すべての要求を設定に書いた開発用の身元からのものとみなします。
 

@@ -1,0 +1,4 @@
+# 公開から3日経っていない版を、依存を足すとき (cargo add) と上げるとき (cargo update) に選ばない。
+# 悪意のある版の多くは公開から数日で見つかるため、そのあいだは取り込まない。
+[registry]
+global-min-publish-age = "3 days"
