@@ -45,3 +45,7 @@ todo = "warn"
 unimplemented = "warn"
 undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn"
+
+[workspace.lints.cargo]
+# Cargo.toml に書いたのに使っていない依存を見つける。
+unused_dependencies = "warn"

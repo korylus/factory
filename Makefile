@@ -69,9 +69,11 @@ fmt-check: ## フォーマットチェック (rustfmt + Oxfmt)
 	cargo fmt --all --check
 	pnpm fmt:check
 
+# build.warnings="deny" で、rustc・clippy・Cargoのリント (未使用の依存など) の警告をエラーにする。
+# .cargo/config.toml に書かずにここで渡すのは、作業の途中の cargo build と cargo test を警告で止めないため。
 .PHONY: lint
 lint: ## clippyを実行
-	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --locked --config 'build.warnings="deny"'
 
 .PHONY: test
 test: ## テストを実行
