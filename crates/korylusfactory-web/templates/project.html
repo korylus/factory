@@ -1,0 +1,186 @@
+{% extends "layout.html" %} {% import "parts.html" as parts %} {% block title %}{{ detail.name }} - {% endblock %}
+{% block scripts %}<script src="{{ crate::assets::project_status_path() }}" defer></script>{% endblock %}
+{% block content %}
+<div id="events" hx-sse:connect="{{ crate::events::PATH }}" hidden></div>
+<nav aria-label="パンくずリスト" class="px-4 text-sm text-muted-foreground md:px-0">
+  <ol class="flex flex-wrap items-center gap-1.5" role="list">
+    <li><a href="/" class="underline-offset-4 hover:text-foreground hover:underline">プロジェクト</a></li>
+    <li aria-hidden="true" class="flex items-center">
+      <svg
+        viewBox="0 0 24 24"
+        class="size-3.5"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="m9 18 6-6-6-6"></path>
+      </svg>
+    </li>
+    <li><span aria-current="page" class="text-foreground wrap-anywhere">{{ detail.name }}</span></li>
+  </ol>
+</nav>
+<p id="project-status-announcement" class="sr-only" role="status" aria-atomic="true"></p>
+<div
+  id="project"
+  data-project-status-view
+  class="flex flex-col gap-4"
+  hx-get="{{ path }}"
+  hx-select="#project > *"
+  hx-swap="innerHTML"
+  hx-trigger="{{ crate::events::STATUS_CHANGED }} from:#events, every 60s"
+>
+  <div
+    class="flex flex-col gap-1 px-4 md:px-0"
+    data-project-name="{{ detail.name }}"
+    data-project-state="{{ detail.state.label() }}"
+    {% if detail.state == State::Paused %}data-project-paused{% endif %}
+  >
+    <div class="flex items-start justify-between gap-2">
+      <h1 class="text-2xl font-semibold wrap-anywhere">{{ detail.name }}</h1>
+      <a
+        class="btn -me-2 shrink-0"
+        data-variant="ghost"
+        data-size="icon"
+        href="{{ settings_path }}"
+        id="project-settings-link"
+        aria-label="プロジェクトの設定"
+        ><svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path
+            d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"
+          ></path>
+          <circle cx="12" cy="12" r="3"></circle></svg
+      ></a>
+    </div>
+    <p class="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+      {% call parts::state_badge(detail.state) %}{% endcall %} {% match detail.last_contact %}{% when Some(contact) %}
+      <span>最後の連絡 <time datetime="{{ contact.datetime }}" class="tabular-nums">{{ contact.ago }}</time></span>
+      {% when None %}
+      <span>まだ連絡がありません</span>
+      {% endmatch %}
+    </p>
+    {% if let Some(mismatch) = detail.mismatch %}
+    <p class="text-sm text-muted-foreground" data-operation-mismatch>{{ mismatch }}</p>
+    {% endif %}
+  </div>
+  {% if detail.state == State::Unreachable %}
+  <div class="alert" data-variant="destructive">
+    {% call parts::state_icon(detail.state) %}{% endcall %}
+    <h2>ディレクターから連絡がありません</h2>
+    <section>
+      {% if detail.last_contact.is_some() %}
+      <p>5分を超えて状態の報告が届いていません。下の内容は、最後に受け取った報告のものです。</p>
+      {% else %}
+      <p>まだ状態の報告を受け取っていません。プロジェクトのVMで korylusfactory start が動いているかを確かめてください。</p>
+      {% endif %}
+    </section>
+  </div>
+  {% endif %} {% if detail.state == State::Waiting %} {% for plan in detail.plans %} {% if let Some(wait) = plan.wait %}
+  <div class="alert" data-variant="warning">
+    {% call parts::state_icon(detail.state) %}{% endcall %}
+    <h2>{{ wait.label }}</h2>
+    <section>
+      <p class="wrap-anywhere">
+        {{ plan.title }}{% if let Some(step) = plan.step %} ・ {{ step }}{% endif %}
+      </p>
+      <p class="leading-6 whitespace-pre-line wrap-anywhere">{{ wait.reason }}</p>
+    </section>
+  </div>
+  {% endif %} {% endfor %} {% endif %} {% if detail.last_contact.is_some() %} {% for plan in detail.plans %}
+  <article class="card" data-size="sm">
+    <header>
+      <h2 class="wrap-anywhere">{{ plan.title }}</h2>
+      <p>
+        {{ plan.tasks.len() }}タスク中{{ plan.done }}つ済み{% if let Some(step) = plan.step %} ・ {{ step }}{% endif %}
+      </p>
+    </header>
+    <section class="px-1.5">
+      {% if plan.tasks.is_empty() %}
+      <p class="px-2 text-sm text-muted-foreground">タスクの一覧はまだありません。</p>
+      {% else %}
+      <ul class="item-group gap-0 divide-y divide-border" role="list">
+        {% for task in plan.tasks %}
+        <li>
+          <div class="item" data-size="sm">
+            <section class="min-w-0">
+              <h3>
+                <span class="font-mono text-xs text-muted-foreground">{{ task.number }}</span
+                ><span class="wrap-anywhere">{{ task.title }}</span>
+              </h3>
+              <p class="line-clamp-none wrap-anywhere">{{ task.status }}</p>
+            </section>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+    {% if let Some(link) = plan.link %}
+    <footer>
+      <a class="btn px-0 underline" data-variant="link" href="{{ link.url }}" id="{{ link.id }}"
+        >作業計画書を開く<span class="sr-only">（{{ plan.title }}）</span></a
+      >
+    </footer>
+    {% endif %}
+  </article>
+  {% else %}
+  <div class="card" data-size="sm">
+    <section>
+      <p class="text-sm text-muted-foreground">進めている作業計画書はありません。</p>
+    </section>
+  </div>
+  {% endfor %} {% if !detail.sessions.is_empty() %}
+  <article class="card" data-size="sm">
+    <header>
+      <h2>最近のセッション</h2>
+    </header>
+    <section class="px-1.5">
+      <ul class="item-group gap-0 divide-y divide-border" role="list">
+        {% for session in detail.sessions %}
+        <li>
+          <div class="item" data-size="sm">
+            <section class="min-w-0">
+              <h3 class="wrap-anywhere">{{ session.heading }}</h3>
+              <p class="line-clamp-none wrap-anywhere">
+                {% for part in session.parts %}{% if !loop.first %} ・ {% endif %}{% match part %}{% when SessionPart::Text(text) %}{{ text }}{% when SessionPart::Model(model) %}<span class="font-mono text-xs">{{ model }}</span>{% endmatch %}{% endfor %}
+              </p>
+            </section>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+  </article>
+  {% endif %}
+  <article class="card" data-size="sm">
+    <header>
+      <h2>これから進める作業計画書</h2>
+    </header>
+    <section>
+      {% if detail.upcoming.is_empty() %}
+      <p class="text-sm text-muted-foreground">ロードマップに、これから進める作業計画書はありません。</p>
+      {% else %}
+      <ol class="flex list-decimal flex-col gap-2 ps-5 text-sm">
+        {% for plan in detail.upcoming %}
+        <li class="wrap-anywhere">
+          {% if let Some(link) = plan.link %}<a href="{{ link.url }}" id="{{ link.id }}" class="underline underline-offset-4">{{ plan.title }}</a
+          >{% else %}{{ plan.title }}{% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </section>
+  </article>
+  {% endif %}
+  <p class="px-4 text-xs text-muted-foreground md:px-0">状態が変わると自動で更新します。</p>
+</div>
+{% endblock %}

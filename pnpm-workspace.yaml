@@ -1,0 +1,3 @@
+# Tailwindの監視モードでだけ使うネイティブのモジュール。CSSは一度だけ作るため、ビルドスクリプトを走らせない。
+allowBuilds:
+  "@parcel/watcher": false

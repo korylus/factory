@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 120,
+  "tabWidth": 2,
+  "ignorePatterns": [
+    "**/node_modules/",
+    "crates/korylusfactory-web/static/app.css",
+    "crates/korylusfactory-web/templates/",
+    "crates/korylusfactory-web/static/htmx.min.js",
+    "crates/korylusfactory-web/static/hx-sse.min.js"
+  ]
+}

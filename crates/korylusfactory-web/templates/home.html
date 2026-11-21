@@ -1,0 +1,58 @@
+{% extends "layout.html" %} {% import "parts.html" as parts %}
+{% block scripts %}<script src="{{ crate::assets::project_status_path() }}" defer></script>{% endblock %}
+{% block content %}
+<div id="events" hx-sse:connect="{{ crate::events::PATH }}" hidden></div>
+<h1 class="px-4 text-2xl font-semibold md:px-0">プロジェクト</h1>
+<p id="project-status-announcement" class="sr-only" role="status" aria-atomic="true"></p>
+<div
+  id="projects"
+  data-project-status-view
+  class="flex flex-col gap-4"
+  hx-get="/"
+  hx-select="#projects > *"
+  hx-swap="innerHTML"
+  hx-trigger="{{ crate::events::STATUS_CHANGED }} from:#events, every 60s"
+>
+  <p class="-mt-3 px-4 text-sm text-muted-foreground md:px-0">{{ summary }}</p>
+  <div class="card" data-size="sm">
+    <section class="px-1.5">
+      {% if projects.is_empty() %}
+      <p class="px-2 text-sm text-muted-foreground">設定にプロジェクトがありません。</p>
+      {% else %}
+      {# マーカーを消したリストもSafariの支援技術に一覧として伝える。 #}
+      {# 行の間には divide-y の線だけを引き、線の上下の余白は行の内側の余白で取る。 #}
+      <ul class="item-group gap-0 divide-y divide-border" role="list">
+        {% for project in projects %}
+        {% let project_path = crate::projects::path(project.name) %}
+        <li>
+          <a class="item" data-size="sm" href="{{ project_path }}" id="project-link-{{ project_path }}">
+            <section class="min-w-0">
+              <h2>{{ project.name }}</h2>
+              {% for part in project.parts %}{% match part %}{% when Part::PlanTitle(title) %}
+              <p class="wrap-anywhere">{{ title }}</p>
+              {% when Part::Text(text) %}
+              <p class="line-clamp-none wrap-anywhere">{{ text }}</p>
+              {% when Part::LastContact { datetime, ago } %}
+              <p class="line-clamp-none wrap-anywhere">
+                最後の連絡 <time datetime="{{ datetime }}" class="tabular-nums">{{ ago }}</time>
+              </p>
+              {% endmatch %}{% endfor %}
+            </section>
+            <div
+              class="flex shrink-0 items-center"
+              data-project-name="{{ project.name }}"
+              data-project-state="{{ project.state.label() }}"
+              {% if project.state == State::Paused %}data-project-paused{% endif %}
+            >
+              {% call parts::state_badge(project.state) %}{% endcall %}
+            </div>
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+  </div>
+  <p class="px-4 text-xs text-muted-foreground md:px-0">状態が変わると自動で更新します。</p>
+</div>
+{% endblock %}

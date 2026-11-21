@@ -1,0 +1,9 @@
+{% extends "layout.html" %} {% block title %}{{ heading }} - {% endblock %} {% block content %}
+<h1 class="px-4 text-2xl font-semibold md:px-0" tabindex="-1" autofocus>{{ heading }}</h1>
+<div class="card">
+  <section class="flex flex-col gap-4">
+    <p class="text-sm">{{ message }}</p>
+    <p><a href="/" class="btn" data-variant="outline">プロジェクトの一覧へ戻る</a></p>
+  </section>
+</div>
+{% endblock %}

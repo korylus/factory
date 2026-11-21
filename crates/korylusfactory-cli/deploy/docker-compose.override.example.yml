@@ -1,0 +1,55 @@
+# プロジェクトのVMで、korylusfactory start を開発環境と一緒に常駐させるcomposeの設定の見本。
+# プロジェクトのcomposeの設定 (docker-compose.yml) に重ねる設定ファイル (docker-compose.override.yml) に写して使う。
+# 手順はリポジトリのREADMEの「プロジェクトのVMで常駐させる」を参照する。
+#
+# 開発コンテナのサービスを `app`、プロジェクトのルートを `/workspace`、開発コンテナの利用者のホームを
+# `/home/developer` とした例。プロジェクトに合わせて書き換える。
+# `ports` を空にする `!reset` には、Docker Compose 2.24.0以降が要る。
+
+# `app` に重ねるボリュームと環境変数は、`factory` にも同じく書く。
+# `extends` は `docker-compose.yml` の `app` だけを引き継ぎ、この設定ファイルで `app` に重ねたものを引き継がないため。
+x-app-volumes: &app-volumes
+  # エージェントのログインや設定など、開発コンテナに重ねているボリュームをここに並べる。
+  # korylusfactoryの実行ファイル。`app` で入れ、`factory` が使う。コンテナを作り直しても残る。
+  - korylusfactory-bin:/home/developer/.local/korylusfactory/bin
+
+services:
+  app:
+    volumes: *app-volumes
+    # VMの再起動と異常終了から戻す。`docker compose stop` で止めたときは戻さない。
+    # データベースなど、開発環境のほかのサービスにも同じく付ける。
+    restart: unless-stopped
+
+  factory:
+    # セッションが、人が使う開発コンテナと同じイメージ・ツール・ログイン・環境変数で動くようにする。
+    extends:
+      file: docker-compose.yml
+      service: app
+    volumes: *app-volumes
+    # `app` とホストのポートを取り合わない。`factory` は待ち受けない。
+    ports: !reset []
+    # 端末を持たない。標準エラーが端末でないため、start は端末のタイトルとベルを出さない。
+    stdin_open: false
+    tty: false
+    working_dir: /workspace
+    # 常駐時にエージェントを起動できるよう、コマンドのある場所をPATHに足す。
+    # execで置き換え、initからのシグナルがstartに届くようにする。
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export PATH="$$HOME/.local/bin:$$PATH"
+        exec "$$HOME/.local/korylusfactory/bin/korylusfactory" start
+    # start をPID 1にせず、シグナルの既定の動作と孤児になったプロセスの回収をinitに任せる。
+    init: true
+    restart: unless-stopped
+    # SIGTERMのあと、セッションの後始末と最後の状態の送信を待つ。過ぎるとSIGKILLで止まる。
+    stop_grace_period: 1m
+    environment:
+      # appの上書き設定で足した環境変数があれば、同じ参照を書く。値は起動時に渡す。
+      # - PROJECT_TOKEN
+      # 人間キューの項目のタイトルの日時を、人が読むタイムゾーンで書く。
+      - TZ=Asia/Tokyo
+
+volumes:
+  korylusfactory-bin:
