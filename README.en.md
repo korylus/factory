@@ -1,4 +1,4 @@
-<!-- last_synced: 2026-11-20 -->
+<!-- last_synced: 2026-11-21 -->
 
 # Korylus Factory
 
@@ -33,14 +33,14 @@ Run every subcommand at the project root.
 
 ### Configuration file
 
-Write the roadmap URL and the roadmap sections that count as approved and as done in `docs/private/factory/config.json` at the project root.
+Write the roadmap URL, the roadmap section that counts as approved, and the sections that count as done in `docs/private/factory/config.json` at the project root.
 To use the human queue and the notifications of human waits, also write the project name, where the human queue lives, and the notification command.
 To send the state to the control web app, also write its URL.
 
 ```json
 {
   "roadmap": "https://wikino.app/s/<space>/pages/<page number>",
-  "sections": ["やってる", "優先度: 高", "優先度: 中"],
+  "section": "やってる",
   "done_sections": ["リリース待ち", "やった"],
   "project": "<project name>",
   "queue": { "space": "<space>", "topic": 12 },
@@ -52,14 +52,14 @@ To send the state to the control web app, also write its URL.
 | Field           | Description                                                                                                                                                                            |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `roadmap`       | The URL of the roadmap page. Only pages on `https://wikino.app` are accepted                                                                                                           |
-| `sections`      | The headings (H2) of the sections that count as approved, advanced in the order written. Defaults to 「やってる」「優先度: 高」「優先度: 中」                                          |
+| `section`       | The heading (H2) of the one section that counts as approved. Its items are advanced from top to bottom. Defaults to 「やってる」                                                       |
 | `done_sections` | The headings (H2) of the sections that count as done (merged). Defaults to 「リリース待ち」 and 「やった」                                                                             |
 | `project`       | The project name, written with letters, digits, hyphens, and underscores. It is passed to human queue items and the notification command. Required when `queue` or `notify` is written |
 | `queue`         | Where the human queue lives (`space`: the space identifier, `topic`: the topic number). When omitted, no items are added and plans are resumed only with `resume`                      |
 | `notify`        | The command that announces human waits (`command`: an array of the command and its arguments), run without a shell. When omitted, nothing is announced                                 |
 | `web`           | The control web app to send the state to (`url`: the web app's URL). The state is sent after writing a state file and every minute. When omitted, nothing is sent                      |
 
-A section missing from the roadmap, a section listed as both approved and done, or an unknown field is treated as a mistake and reported as an error.
+A section missing from the roadmap, an approved section heading that appears more than once in the roadmap, an approved section also listed as done, or an unknown field is treated as a mistake and reported as an error.
 
 The roadmap and work plans are read with the `wikino` command, preferring the draft when there is one.
 Read permission on the token used for `wikino auth login <space>` is enough for korylusfactory itself.
@@ -264,7 +264,7 @@ While waiting for the work report to be checked, `start` reads the roadmap every
 
 When 1 holds but 2 does not, it shows the branches that are not merged and waits.
 A work plan without tasks that create branches is done with 1 alone.
-A work plan recorded as done is not advanced even if it is in an approved section of the roadmap.
+A work plan recorded as done is not advanced even if it is in the approved section of the roadmap.
 
 ### `status`
 
@@ -272,7 +272,8 @@ It shows the korylusfactory version, the order of the work plans to advance, and
 In a project whose configuration file has `web`, if the last setting read shows the project as paused, it shows right after the version that the project is paused and when that setting was read ("[Running and pausing](#running-and-pausing)").
 It then shows the last agents per role it read, one slot per line in the form 「作業者: Claude Code・claude-opus-5-5・high」 ("[Agents per role](#agents-per-role)").
 
-The order lists the Wikilinks whose titles end with 「作業計画書」 in the items of the approved sections, by section order and then from top to bottom within each section.
+The order lists the Wikilinks whose titles end with 「作業計画書」 in the items of the approved section, from top to bottom.
+Work plans in other sections (such as 「優先度: 高」) are not included.
 Items with only a name (plans not written yet), links to tickets, and nested items are skipped.
 When several links point to the same work plan, only the first is kept.
 Work plans recorded as done are left out of the order.

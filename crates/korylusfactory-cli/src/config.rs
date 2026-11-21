@@ -5,7 +5,7 @@
 //! ```json
 //! {
 //!   "roadmap": "https://wikino.app/s/<スペース>/pages/<ページ番号>",
-//!   "sections": ["やってる", "優先度: 高", "優先度: 中"],
+//!   "section": "やってる",
 //!   "done_sections": ["リリース待ち", "やった"],
 //!   "project": "mewst",
 //!   "queue": {"space": "<スペース>", "topic": 12},
@@ -14,7 +14,7 @@
 //! }
 //! ```
 //!
-//! `sections` は承認とみなすロードマップの節で、省略すると [`DEFAULT_SECTIONS`] を使う。
+//! `section` は承認とみなすロードマップの節で、省略すると [`DEFAULT_SECTION`] を使う。
 //! `done_sections` は完了 (マージ済み) とみなす節で、省略すると [`DEFAULT_DONE_SECTIONS`] を使う。
 //! `project` はプロジェクト名で、`queue` か `notify` を書くときは必ず書く。
 //! `queue` は人間キューの置き場 (Wikinoのスペースとトピック) で、省略すると項目を積まない。
@@ -25,7 +25,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use korylusfactory_core::queue::DEFAULT_SECTIONS;
+pub use korylusfactory_core::queue::DEFAULT_SECTION;
 
 /// 完了とみなす節の初期値。どちらの節も、既定のベースにマージしたあとの状態を表す。
 pub const DEFAULT_DONE_SECTIONS: [&str; 2] = ["リリース待ち", "やった"];
@@ -79,24 +79,23 @@ pub enum Error {
     },
 
     /// 承認とみなす節が空。進める計画書が常に無くなるため、書き誤りとして扱う。
-    #[error("設定ファイル {} の「sections」が空です。承認とみなす節の見出しを1つ以上書いてください", .0.display())]
-    NoSections(PathBuf),
+    #[error("設定ファイル {} の「section」が空です。承認とみなす節の見出しを書いてください", .0.display())]
+    NoSection(PathBuf),
 
     /// 完了とみなす節が空。作業計画書の完了を検知できなくなるため、書き誤りとして扱う。
     #[error("設定ファイル {} の「done_sections」が空です。完了とみなす節の見出しを1つ以上書いてください", .0.display())]
     NoDoneSections(PathBuf),
 
-    /// 承認とみなす節と完了とみなす節に、同じ節がある。
+    /// 承認とみなす節が、完了とみなす節にもある。
     #[error(
-        "設定ファイル {} の「sections」と「done_sections」に同じ節 {} があります。承認とみなす節と完了とみなす節は分けてください",
-        .path.display(),
-        .sections.iter().map(|s| format!("「{s}」")).collect::<Vec<_>>().join("・")
+        "設定ファイル {} の「section」と「done_sections」に同じ節 「{section}」 があります。承認とみなす節と完了とみなす節は分けてください",
+        .path.display()
     )]
-    OverlappingSections {
+    OverlappingSection {
         /// 設定ファイルのパス。
         path: PathBuf,
         /// 両方にある節。
-        sections: Vec<String>,
+        section: String,
     },
 
     /// 人間キューか通知のコマンドを書いたのに、プロジェクト名が無い。
@@ -145,12 +144,18 @@ pub enum Error {
 #[serde(deny_unknown_fields)]
 struct File {
     roadmap: String,
-    sections: Option<Vec<String>>,
+    #[serde(default = "default_section")]
+    section: String,
     done_sections: Option<Vec<String>>,
     project: Option<String>,
     queue: Option<QueueFile>,
     notify: Option<NotifyFile>,
     web: Option<WebFile>,
+}
+
+/// 設定で承認とみなす節を省略したときの見出し。
+fn default_section() -> String {
+    DEFAULT_SECTION.to_owned()
 }
 
 /// 設定ファイルの「web」の形。
@@ -180,8 +185,8 @@ struct NotifyFile {
 pub struct Config {
     /// ロードマップのページ。
     pub roadmap: Wikino,
-    /// 承認とみなすロードマップの節の見出し。上から順に進める。
-    pub sections: Vec<String>,
+    /// 承認とみなすロードマップの節の見出し。節の項目を上から順に進める。
+    pub section: String,
     /// 完了 (マージ済み) とみなすロードマップの節の見出し。
     pub done_sections: Vec<String>,
     /// プロジェクト名と、人間待ちの置き場・知らせ方。「project」を書かなければ `None`。
@@ -229,26 +234,17 @@ pub fn load(root: &Path) -> Result<Config, Error> {
             path: path.clone(),
             source: Box::new(source),
         })?;
-    let sections = match file.sections {
-        Some(sections) if sections.is_empty() => return Err(Error::NoSections(path)),
-        Some(sections) => sections,
-        None => DEFAULT_SECTIONS.map(str::to_owned).to_vec(),
-    };
+    let section = file.section;
+    if section.is_empty() {
+        return Err(Error::NoSection(path));
+    }
     let done_sections = match file.done_sections {
         Some(done) if done.is_empty() => return Err(Error::NoDoneSections(path)),
         Some(done) => done,
         None => DEFAULT_DONE_SECTIONS.map(str::to_owned).to_vec(),
     };
-    let overlapping: Vec<String> = done_sections
-        .iter()
-        .filter(|name| sections.contains(name))
-        .cloned()
-        .collect();
-    if !overlapping.is_empty() {
-        return Err(Error::OverlappingSections {
-            path,
-            sections: overlapping,
-        });
+    if done_sections.contains(&section) {
+        return Err(Error::OverlappingSection { path, section });
     }
     let web = file
         .web
@@ -257,7 +253,7 @@ pub fn load(root: &Path) -> Result<Config, Error> {
     let project = read_project(path, file.project, file.queue, file.notify)?;
     Ok(Config {
         roadmap,
-        sections,
+        section,
         done_sections,
         project,
         web,
@@ -341,11 +337,7 @@ mod tests {
                     space: "shimbaco".to_owned(),
                     number: 1214,
                 },
-                sections: vec![
-                    "やってる".to_owned(),
-                    "優先度: 高".to_owned(),
-                    "優先度: 中".to_owned(),
-                ],
+                section: "やってる".to_owned(),
                 done_sections: vec!["リリース待ち".to_owned(), "やった".to_owned()],
                 project: None,
                 web: None,
@@ -513,12 +505,11 @@ mod tests {
 
     #[test]
     fn 承認とみなす節と完了とみなす節が重なればエラー() {
-        let root = project(
-            r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "sections": ["やってる", "やった"]}"#,
-        );
+        let root =
+            project(r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": "やった"}"#);
         let err = load(root.path()).expect_err("エラーにならなかった");
         assert!(
-            matches!(&err, Error::OverlappingSections { sections, .. } if sections == &["やった"]),
+            matches!(&err, Error::OverlappingSection { section, .. } if section == "やった"),
             "エラー = {err:?}"
         );
         assert!(
@@ -530,12 +521,12 @@ mod tests {
     }
 
     #[test]
-    fn 書いた節をその順に使う() {
+    fn 書いた承認とみなす節を使う() {
         let root = project(
-            r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "sections": ["優先度: 高", "やってる"]}"#,
+            r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "section": "着手"}"#,
         );
         let config = load(root.path()).expect("設定を読めなかった");
-        assert_eq!(config.sections, ["優先度: 高", "やってる"]);
+        assert_eq!(config.section, "着手", "書いた承認とみなす節を読まなかった");
     }
 
     #[test]
@@ -554,10 +545,22 @@ mod tests {
     fn 書き方の誤りはエラー() {
         let cases = [
             ("JSONではない", "roadmap = 1"),
-            ("roadmapが無い", r#"{"sections": ["やってる"]}"#),
+            ("roadmapが無い", r#"{"section": "やってる"}"#),
             (
                 "知らない項目がある",
-                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": []}"#,
+                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "title": "x"}"#,
+            ),
+            (
+                "sectionsを書いている",
+                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "sections": ["やってる"]}"#,
+            ),
+            (
+                "sectionが配列",
+                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": ["やってる"]}"#,
+            ),
+            (
+                "sectionがnull",
+                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": null}"#,
             ),
             (
                 "queueに知らない項目がある",
@@ -599,8 +602,8 @@ mod tests {
     #[test]
     fn 節が空ならエラー() {
         let root =
-            project(r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "sections": []}"#);
+            project(r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": ""}"#);
         let err = load(root.path()).expect_err("エラーにならなかった");
-        assert!(matches!(err, Error::NoSections(_)), "エラー = {err:?}");
+        assert!(matches!(err, Error::NoSection(_)), "エラー = {err:?}");
     }
 }
