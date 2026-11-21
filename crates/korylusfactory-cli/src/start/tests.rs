@@ -16,10 +16,12 @@ use std::time::Duration;
 use jiff::{SignedDuration, Timestamp};
 use korylusfactory_core::flow::RETRY_LIMIT;
 use korylusfactory_core::state::{
-    ItemPage, Notice, NoticeKind, Notified, PlanDir, QueuedItem, Step, Verdict, WaitItem,
+    ItemPage, Notice, NoticeKind, Notified, PlanDir, QueuedItem, Reviewer, SessionResult, Step,
+    Verdict, WaitItem,
 };
 use serde_json::{Value, json};
 
+use super::Clock as _;
 use super::*;
 use crate::branch::testutil::{Repo, git_run, repo_on, write_file};
 use crate::human_queue::{self, Listed, Location, Status};
@@ -105,6 +107,8 @@ struct Sessions<'a> {
     wiki: &'a Wiki,
     works: RefCell<VecDeque<Work<'a>>>,
     prompts: RefCell<Vec<String>>,
+    /// 起動したコマンドと引数。
+    commands: RefCell<Vec<(String, Vec<String>)>>,
 }
 
 impl<'a> Sessions<'a> {
@@ -113,11 +117,16 @@ impl<'a> Sessions<'a> {
             wiki,
             works: RefCell::new(works.into()),
             prompts: RefCell::new(Vec::new()),
+            commands: RefCell::new(Vec::new()),
         }
     }
 
     fn prompts(&self) -> Vec<String> {
         self.prompts.borrow().clone()
+    }
+
+    fn commands(&self) -> Vec<(String, Vec<String>)> {
+        self.commands.borrow().clone()
     }
 }
 
@@ -126,6 +135,14 @@ impl Launcher for Sessions<'_> {
         self.prompts
             .borrow_mut()
             .push(String::from_utf8(session.input.clone()).expect("指示がUTF-8ではない"));
+        self.commands.borrow_mut().push((
+            session.program.clone(),
+            session
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        ));
         let work = self
             .works
             .borrow_mut()
@@ -689,6 +706,64 @@ fn assert_command(prompt: &str, command: &str) {
     );
 }
 
+/// whole_plan のセッションを進め終えた状態stateに、レビュアーとセッションの記録が残っていることを確かめる。
+fn assert_whole_plan_sessions(state: &PlanState) {
+    let reviewers: Vec<Reviewer> = state.tasks[0]
+        .review
+        .reviews
+        .iter()
+        .map(|review| review.role)
+        .collect();
+    assert_eq!(
+        reviewers,
+        [Reviewer::Codex, Reviewer::Claude],
+        "レビューを動かしたエージェントをレビュアーとして記録していない"
+    );
+    // 各セッションの「タスク ステップ レビューの回数 枠 エージェント 評価」。結果はすべて記録した。
+    let records: Vec<String> = state
+        .sessions
+        .iter()
+        .map(|session| {
+            assert_eq!(
+                session.result,
+                Some(SessionResult::Recorded),
+                "結果を記録していない"
+            );
+            format!(
+                "{} {:?} {:?} {:?} {} {:?}",
+                session.task.as_deref().unwrap_or("-"),
+                session.step,
+                session.review,
+                session.slot,
+                session.agent,
+                session.verdict
+            )
+        })
+        .collect();
+    assert_eq!(
+        records,
+        [
+            "1-1 Implement None Implementer claude None",
+            "1-1 Review Some(1) ReviewerOdd codex Some(RequestChanges)",
+            "1-1 Fix Some(1) ReviewerOdd codex None",
+            "1-1 Review Some(2) ReviewerEven claude Some(Approve)",
+            "1-2 Implement None Implementer claude None",
+            "1-2 Review Some(1) ReviewerOdd codex Some(Approve)",
+            "- Report None Implementer claude None",
+        ],
+        "起動したセッションの記録が違う"
+    );
+    assert!(
+        state
+            .sessions
+            .iter()
+            .all(|session| session.ended_at.is_some()
+                && session.model.is_none()
+                && session.effort.is_none()),
+        "終わったセッションの時刻か、指定していないモデルとeffortの記録が違う"
+    );
+}
+
 #[test]
 fn ロードマップの作業計画書をタスクの実装とレビューから作業報告書まで進めて確認を待つ() {
     let repo = project();
@@ -728,6 +803,7 @@ fn ロードマップの作業計画書をタスクの実装とレビューか�
         .map(|review| review.verdict)
         .collect();
     assert_eq!(verdicts, [Verdict::RequestChanges, Verdict::Approve]);
+    assert_whole_plan_sessions(&state);
     assert_eq!(
         state.tasks[0].verification.len(),
         1,
@@ -809,6 +885,16 @@ fn 完了の条件を満たさなければ理由を添えて間隔を空けて�
         state.step,
         Some(Step::Implement),
         "同じステップのまま待っていない"
+    );
+    let results: Vec<_> = state
+        .sessions
+        .iter()
+        .map(|session| session.result)
+        .collect();
+    assert_eq!(
+        results,
+        [Some(SessionResult::Unfinished); 4],
+        "終えられなかったセッションの結果を記録していない"
     );
     assert_eq!(
         clock.sleeps(),
@@ -934,6 +1020,15 @@ fn セッションが人間の判断を求めたら同じステップのまま�
         "同じステップのまま待っていない"
     );
     assert_eq!(
+        state
+            .sessions
+            .iter()
+            .map(|session| session.result)
+            .collect::<Vec<_>>(),
+        [Some(SessionResult::Asked)],
+        "人間の判断を求めたセッションの結果を記録していない"
+    );
+    assert_eq!(
         out.matches("demo: 人間を待っています (セッションからの質問): 実装のセッションが、人間の判断を求めて終わりました\n  設計を変えてよいか\n").count(),
         1,
         "待っている理由を1回だけ表示していない:\n{out}"
@@ -964,7 +1059,59 @@ fn 取り消したらセッションの結果を記録せずに終える() {
     let state = load(root);
     assert_eq!(state.step, Some(Step::Implement), "ステップが変わった");
     assert_eq!(state.retries, 0, "やり直しの回数に数えた");
+    assert!(
+        state.session_started,
+        "次に起動するセッションへ中断を伝える印を外した"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .iter()
+            .map(|session| session.result)
+            .collect::<Vec<_>>(),
+        [Some(SessionResult::Cancelled)],
+        "取り消したセッションの結果を記録していない"
+    );
     assert_eq!(clock.sleeps(), [], "取り消したのに待った");
+}
+
+#[test]
+fn セッションの取り消しと状態変更が重なっても取り消しを記録して待ちを残す() {
+    let repo = project();
+    let root = repo.root.as_path();
+    let wiki = wiki(root);
+    let cancel = AtomicBool::new(false);
+    let wait = Wait {
+        kind: WaitKind::Question,
+        reason: "人間の判断を待つ".to_owned(),
+        details: Vec::new(),
+    };
+    let sessions = Sessions::new(
+        &wiki,
+        vec![Box::new(|_: &Wiki| {
+            let lock = plan_dir(root).lock().expect("状態のロックを取れなかった");
+            let mut state = lock
+                .load()
+                .expect("状態を読めなかった")
+                .expect("状態が無い");
+            state.wait = Some(wait.clone());
+            lock.save(&state).expect("人間待ちを保存できなかった");
+            cancel.store(true, Ordering::SeqCst);
+            Some(implemented())
+        })],
+    );
+    let clock = Clock::new(usize::MAX, &cancel);
+
+    run_loop(root, &wiki, &sessions, &clock);
+
+    let state = load(root);
+    assert_eq!(state.wait.as_ref(), Some(&wait), "人間待ちが変わった");
+    assert!(state.session_started, "開始の印を外した");
+    assert_eq!(
+        state.sessions.last().and_then(|session| session.result),
+        Some(SessionResult::Cancelled),
+        "取り消したセッションの結果を記録していない"
+    );
 }
 
 #[test]
@@ -2591,6 +2738,10 @@ impl web::Transport for Recorded {
         }
         Ok(self.status)
     }
+
+    fn get(&self, _: &str) -> Result<(u16, Vec<u8>), String> {
+        Ok((200, br#"{"paused": false}"#.to_vec()))
+    }
 }
 
 /// ウェブアプリを設定したプロジェクトで監督のループを動かし、送った報告・進捗と診断・届かなかったときの警告を返す。
@@ -2802,4 +2953,1036 @@ fn 待機中に別のスレッドで取り消すと時計の待ちが終わる()
         });
         assert!(waited, "待機に入る前に戻った");
     });
+}
+
+/// 稼働の設定を読んだときに返す結果。
+type SettingsResult = Result<(u16, Vec<u8>), String>;
+
+/// 稼働を返す応答。
+const RUNNING: &[u8] = br#"{"paused": false}"#;
+/// 停止を返す応答。
+const PAUSED: &[u8] = br#"{"paused": true}"#;
+
+/// 本文bodyを返す、200の応答。
+fn ok(body: &[u8]) -> (u16, Vec<u8>) {
+    (200, body.to_vec())
+}
+
+/// 決めた順に稼働の設定を返し、送った状態の報告を記録する経路。最後の結果は繰り返し返す。
+struct Operated {
+    settings: std::sync::Mutex<VecDeque<SettingsResult>>,
+    reads: std::sync::Mutex<usize>,
+    reports: std::sync::Mutex<Vec<korylusfactory_protocol::StatusReport>>,
+}
+
+impl Operated {
+    fn new(settings: Vec<SettingsResult>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            settings: std::sync::Mutex::new(settings.into()),
+            reads: std::sync::Mutex::new(0),
+            reports: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn reads(&self) -> usize {
+        *self.reads.lock().expect("読んだ回数を読めなかった")
+    }
+
+    fn last_report(&self) -> korylusfactory_protocol::StatusReport {
+        self.reports
+            .lock()
+            .expect("送った報告を読めなかった")
+            .last()
+            .cloned()
+            .expect("状態の報告を送っていない")
+    }
+}
+
+impl web::Transport for Operated {
+    fn put(&self, _: &str, body: &[u8]) -> Result<u16, String> {
+        let report = serde_json::from_slice(body).expect("送った本文が状態の報告ではない");
+        self.reports
+            .lock()
+            .expect("送った報告を記録できなかった")
+            .push(report);
+        Ok(204)
+    }
+
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        assert_eq!(
+            url, "https://factory.example.com/api/v1/director/settings",
+            "設定を読むURLが違う"
+        );
+        *self.reads.lock().expect("読んだ回数を書けなかった") += 1;
+        let mut settings = self.settings.lock().expect("設定の結果を読めなかった");
+        if settings.len() > 1 {
+            settings.pop_front().expect("設定の結果が無い")
+        } else {
+            settings.front().cloned().expect("設定の結果が無い")
+        }
+    }
+}
+
+/// ウェブアプリを設定したプロジェクト。プロジェクトのルートが、タスクのリポジトリを兼ねる。
+fn web_project() -> (Repo, Wiki) {
+    let repo = repo_on("main");
+    let root = repo.root.as_path();
+    write_file(
+        root,
+        config::CONFIG_PATH,
+        br#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {"url": "https://factory.example.com/"}}"#,
+    );
+    let wiki = wiki(root);
+    (repo, wiki)
+}
+
+/// ウェブアプリから稼働の設定をtransportで読むプロジェクトrootで監督のループを動かし、進捗と診断・警告を返す。
+fn run_operating(
+    root: &Path,
+    wiki: &Wiki,
+    sessions: &dyn Launcher,
+    clock: &Clock<'_>,
+    queues: &dyn Open,
+    transport: &std::sync::Arc<Operated>,
+) -> (String, Vec<String>) {
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warned = std::sync::Arc::clone(&warnings);
+    let link = web::Link {
+        transport: transport.clone(),
+        warn: std::sync::Arc::new(move |text: &str| {
+            warned
+                .lock()
+                .expect("警告を記録できなかった")
+                .push(text.to_owned());
+        }),
+        load_roadmap: std::sync::Arc::new(|_, _| Ok(Vec::new())),
+        interval: web::INTERVAL,
+    };
+    let build = build();
+    let start = Start {
+        runner: wiki,
+        launcher: sessions,
+        clock,
+        queues,
+        notifier: &NoQueue,
+        terminal: false,
+        time_zone: &TimeZone::UTC,
+        build: &build,
+        web: &link,
+        root,
+        timing: Timing::default(),
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run(&start, &mut out, &mut err, clock.cancel).expect("監督のループがエラーで終わった");
+    let warnings = warnings.lock().expect("警告を読めなかった").clone();
+    (
+        format!(
+            "{}{}",
+            String::from_utf8(out).expect("進捗がUTF-8ではない"),
+            String::from_utf8(err).expect("診断がUTF-8ではない")
+        ),
+        warnings,
+    )
+}
+
+const PAUSED_TEXT: &str = "ウェブアプリの設定で停止しています。稼働に戻されたら作業を再開します";
+const RESUMED_TEXT: &str = "ウェブアプリの設定で稼働に戻されました。作業を再開します";
+
+fn question() -> Work<'static> {
+    Box::new(|_: &Wiki| Some(json!({"needs_human": "設計を変えてよいか", "verification": []})))
+}
+
+#[test]
+fn 停止している間は作業計画書を始めず_1分ごとに読み直して稼働に戻ると始める() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(&wiki, vec![question()]);
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(3, &cancel);
+    let transport = Operated::new(vec![Ok(ok(PAUSED)), Ok(ok(PAUSED)), Ok(ok(RUNNING))]);
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    assert_eq!(
+        clock.sleeps()[..2],
+        [Duration::from_mins(1), Duration::from_mins(1)],
+        "停止している間に1分ごとに読み直していない:\n{out}"
+    );
+    assert_eq!(
+        out.matches(PAUSED_TEXT).count(),
+        1,
+        "停止を1回だけ表示していない:\n{out}"
+    );
+    assert!(
+        out.contains(RESUMED_TEXT),
+        "稼働に戻ったことを表示していない:\n{out}"
+    );
+    assert!(
+        out.find(RESUMED_TEXT) < out.find("作業計画書 demo を始めます"),
+        "稼働に戻る前に作業計画書を始めた:\n{out}"
+    );
+    assert_eq!(
+        sessions.prompts().len(),
+        1,
+        "稼働に戻ってからセッションを起動していない"
+    );
+    assert!(
+        !transport.last_report().paused,
+        "稼働に戻ったのに停止として報告した"
+    );
+    assert_eq!(
+        crate::operation::load(root)
+            .expect("最後に読めた設定を読めなかった")
+            .map(|saved| saved.paused),
+        Some(false),
+        "最後に読めた設定を書いていない"
+    );
+    assert!(warnings.is_empty(), "読めたのに警告を出した: {warnings:?}");
+}
+
+#[test]
+fn セッションのあとに停止に切り替えると次のセッションを起動せず_停止として報告する() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(
+        &wiki,
+        vec![Box::new(move |wiki: &Wiki| {
+            commit(root, "state.txt");
+            wiki.check("1-1");
+            Some(implemented())
+        })],
+    );
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    // 作業計画書を始める前と、実装のセッションの前は稼働で、レビューの前に停止に切り替わる。
+    let transport = Operated::new(vec![Ok(ok(RUNNING)), Ok(ok(RUNNING)), Ok(ok(PAUSED))]);
+
+    let (out, _) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    assert_eq!(
+        sessions.prompts().len(),
+        1,
+        "停止に切り替えたあとにセッションを起動した:\n{out}"
+    );
+    assert!(out.contains(PAUSED_TEXT), "停止を表示していない:\n{out}");
+    assert_eq!(load(root).step, Some(Step::Review), "停止中に状態を進めた");
+    let report = transport.last_report();
+    assert!(
+        report.paused && !report.running,
+        "停止を反映したことを報告していない: {report:?}"
+    );
+    assert_eq!(
+        crate::operation::load(root)
+            .expect("最後に読めた設定を読めなかった")
+            .map(|saved| saved.paused),
+        Some(true),
+        "読んだ停止の設定を書いていない"
+    );
+}
+
+#[test]
+fn 停止の設定でも人間キューで受け取った回答を適用し_次のセッションは起動しない() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    write_file(
+        root,
+        config::CONFIG_PATH,
+        br#"{
+            "roadmap": "https://wikino.app/s/shimbaco/pages/1214",
+            "project": "mewst",
+            "queue": {"space": "shimbaco", "topic": 12},
+            "web": {"url": "https://factory.example.com/"}
+        }"#,
+    );
+    wiki.set(PLAN_PAGE, "**計画書名**: demo\n\n## タスクリスト\n\n- [ ] **1-1**: 下書きを作る\n  - **担当**: implementer\n".to_owned());
+    let label = "セッションからの質問";
+    let question = "設計を変えてよいか";
+    let answer = "設計を変えて進めてください。";
+    save_waiting(
+        root,
+        Wait {
+            kind: WaitKind::Question,
+            reason: "人間の判断を求めて終わりました".to_owned(),
+            details: vec![question.to_owned()],
+        },
+        5,
+        label,
+        |state| {
+            state.task = Some("1-1".to_owned());
+            state.step = Some(Step::Work);
+            state.snapshot = Some(wiki.page(PLAN_PAGE));
+        },
+    );
+    let queue = Queue::default();
+    queue.insert(
+        5,
+        Page::Draft {
+            title: item_title(label),
+            body: String::new(),
+        },
+    );
+    let sessions = Sessions::new(&wiki, Vec::new());
+    let cancel = AtomicBool::new(false);
+    // 5秒ずつ人間を待ち、1分後に回答を読んでから停止を反映した回で終える。
+    let clock = Clock::new(13, &cancel);
+    clock.on_first_sleep(|| {
+        queue.insert(
+            5,
+            Page::Published {
+                title: item_title(label),
+                body: format!("## 回答\n\n### 質問への回答\n\n{answer}\n"),
+            },
+        );
+    });
+    let transport = Operated::new(vec![Ok(ok(PAUSED))]);
+
+    let (out, _) = run_operating(root, &wiki, &sessions, &clock, &queue, &transport);
+
+    assert!(
+        out.contains("demo: 人間を待っています (セッションからの質問)"),
+        "人間待ちを表示していない:\n{out}"
+    );
+    assert_eq!(
+        queue.calls(),
+        ["read 5", "read 5"],
+        "下書きと公開後の回答を読まなかった"
+    );
+    let state = load(root);
+    assert!(state.wait.is_none(), "回答を適用して待ちを解かなかった");
+    assert_eq!(
+        state.answers,
+        [korylusfactory_core::state::HumanAnswer {
+            question: question.to_owned(),
+            answer: answer.to_owned(),
+        }],
+        "人間キューから読んだ回答を記録しなかった"
+    );
+    assert!(
+        out.contains(PAUSED_TEXT),
+        "待ちが解けたあとに停止を表示していない:\n{out}"
+    );
+    assert_eq!(transport.reads(), 1, "人間を待っている間に設定を読んだ");
+    assert!(
+        transport.last_report().paused,
+        "回答のあとに停止を報告していない"
+    );
+    assert!(
+        sessions.prompts().is_empty(),
+        "停止中にセッションを起動した"
+    );
+}
+
+#[test]
+fn 届かないときは最後に読めた停止の設定に従い_警告を1回だけ出す() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    crate::operation::save(
+        root,
+        &crate::operation::Saved {
+            agents: std::collections::BTreeMap::new(),
+            paused: true,
+            read_at: "2026-11-16T00:00:00Z".parse().expect("時刻を読めなかった"),
+        },
+    )
+    .expect("最後に読めた設定を書けなかった");
+    let sessions = Sessions::new(&wiki, Vec::new());
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(2, &cancel);
+    let transport = Operated::new(vec![Err("接続できません".to_owned())]);
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    assert!(
+        sessions.prompts().is_empty(),
+        "最後に読めた停止の設定に従わなかった"
+    );
+    assert!(out.contains(PAUSED_TEXT), "停止を表示していない:\n{out}");
+    assert_eq!(transport.reads(), 2, "1分ごとに読み直していない");
+    assert_eq!(
+        warnings,
+        [
+            "ウェブアプリから稼働の設定を読めません: 接続できません。最後に読めた停止の設定に従います"
+        ],
+        "警告の出し方が違う"
+    );
+    assert!(transport.last_report().paused, "停止を報告していない");
+}
+
+#[test]
+fn 届かずに最後に読めた設定も無ければ稼働として進め_1分経つまで読み直さない() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(&wiki, vec![question()]);
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let transport = Operated::new(vec![Ok((503, Vec::new()))]);
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    assert_eq!(
+        sessions.prompts().len(),
+        1,
+        "届かないときに稼働として進めなかった:\n{out}"
+    );
+    assert_eq!(
+        transport.reads(),
+        1,
+        "届かなかったあと、1分経つ前に読み直した"
+    );
+    assert_eq!(
+        warnings,
+        ["ウェブアプリが稼働の設定を返しませんでした (ステータス 503)。稼働として進めます"],
+        "警告の出し方が違う"
+    );
+    assert!(!out.contains(PAUSED_TEXT), "停止を表示した:\n{out}");
+    assert_eq!(
+        crate::operation::load(root).expect("最後に読めた設定を読めなかった"),
+        None,
+        "読めなかった設定を書いた"
+    );
+}
+
+#[test]
+fn ウェブアプリを設定しなければ稼働の設定を読まずに進める() {
+    let repo = project();
+    let root = repo.root.as_path();
+    let wiki = wiki(root);
+    let sessions = Sessions::new(&wiki, vec![question()]);
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+
+    let (out, _) = loop_outputs(root, &wiki, &sessions, &clock, &build());
+
+    assert_eq!(
+        sessions.prompts().len(),
+        1,
+        "ウェブアプリが無いのに進めなかった:\n{out}"
+    );
+    assert!(
+        !root.join(crate::operation::PATH).exists(),
+        "ウェブアプリが無いのに最後に読めた設定を書いた"
+    );
+}
+
+#[test]
+fn 保存が失敗しても書けるようになれば最初に読んだ停止を保存する() {
+    for next_read in [Ok(ok(PAUSED)), Err("通信できません".to_owned())] {
+        let (repo, wiki) = web_project();
+        let root = repo.root.as_path();
+        let sessions = Sessions::new(&wiki, Vec::new());
+        let cancel = AtomicBool::new(false);
+        let clock = Clock::new(2, &cancel);
+        let read_at = clock.now();
+        let running = crate::operation::Saved {
+            agents: std::collections::BTreeMap::new(),
+            paused: false,
+            read_at,
+        };
+        crate::operation::save(root, &running).expect("以前の稼働の設定を書けなかった");
+
+        let temporary = root.join(crate::operation::PATH).with_extension("json.tmp");
+        fs::create_dir(&temporary).expect("書けない一時ファイルのパスを用意できなかった");
+        clock.on_first_sleep(move || {
+            assert_eq!(
+                crate::operation::load(root).expect("設定を読めなかった"),
+                Some(running),
+                "保存に失敗した設定がファイルに反映された"
+            );
+            fs::remove_dir(&temporary).expect("設定の保存先を戻せなかった");
+        });
+        let transport = Operated::new(vec![Ok(ok(PAUSED)), next_read]);
+        let (_, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|text| text.contains("読んだ設定に従います")),
+            "書けなかったときに警告しなかった"
+        );
+        assert_eq!(
+            crate::operation::load(root).expect("書き直した設定を読めなかった"),
+            Some(crate::operation::Saved {
+                agents: std::collections::BTreeMap::new(),
+                paused: true,
+                read_at
+            }),
+            "保存先の回復後に、最初に読んだ時刻と停止を保存していない"
+        );
+        let cancel = AtomicBool::new(false);
+        let restarted = Operated::new(vec![Err("通信できません".to_owned())]);
+        run_operating(
+            root,
+            &wiki,
+            &sessions,
+            &Clock::new(1, &cancel),
+            &NoQueue,
+            &restarted,
+        );
+
+        assert!(
+            restarted.last_report().paused,
+            "届かないまま起動し直したときに停止を反映していない"
+        );
+        assert!(
+            sessions.prompts().is_empty(),
+            "停止中にセッションを起動した"
+        );
+    }
+}
+
+#[test]
+fn 配列の応答を受け取っても最後に読んだ停止に従う() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(&wiki, Vec::new());
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(2, &cancel);
+    let saved = crate::operation::Saved {
+        agents: std::collections::BTreeMap::new(),
+        paused: true,
+        read_at: clock.now(),
+    };
+    crate::operation::save(root, &saved).expect("以前の停止の設定を書けなかった");
+    let transport = Operated::new(vec![Ok(ok(b"[]")), Ok(ok(b"[false]"))]);
+
+    let (_, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    assert_eq!(transport.reads(), 2, "両方の応答を読まなかった");
+    assert_eq!(
+        warnings,
+        [
+            "ウェブアプリから受け取った稼働の設定を読み取れません: JSONオブジェクトではありません。最後に読めた停止の設定に従います"
+        ],
+        "設定の形式が違うことを警告しなかった"
+    );
+    assert_eq!(
+        crate::operation::load(root).expect("設定を読めなかった"),
+        Some(saved),
+        "停止の設定を書き換えた"
+    );
+    assert!(transport.last_report().paused, "停止を報告していない");
+    assert!(
+        sessions.prompts().is_empty(),
+        "停止中にセッションを起動した"
+    );
+}
+
+#[test]
+fn 通信が終わった時刻を記録し_失敗から1分経つまで読み直さない() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    struct Delayed {
+        transport: Arc<Operated>,
+        seconds: AtomicU64,
+    }
+
+    impl web::Transport for Delayed {
+        fn put(&self, url: &str, body: &[u8]) -> Result<u16, String> {
+            self.transport.put(url, body)
+        }
+
+        fn get(&self, url: &str) -> SettingsResult {
+            self.sleep(Duration::from_secs(10));
+            self.transport.get(url)
+        }
+    }
+
+    impl super::Clock for Delayed {
+        fn now(&self) -> Timestamp {
+            let seconds =
+                i64::try_from(self.seconds.load(Ordering::SeqCst)).expect("経過時間が大きすぎる");
+            Timestamp::from_second(seconds).expect("時刻にできなかった")
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.seconds.fetch_add(duration.as_secs(), Ordering::SeqCst);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れなかった");
+    let endpoint = web::Endpoint::parse("https://factory.example.com/").expect("URLを読めなかった");
+    let transport = Operated::new(vec![Err("通信できません".to_owned()), Ok(ok(PAUSED))]);
+    let clock = Arc::new(Delayed {
+        transport: Arc::clone(&transport),
+        seconds: AtomicU64::new(0),
+    });
+    let link = web::Link {
+        transport: clock.clone(),
+        warn: Arc::new(|_| {}),
+        load_roadmap: Arc::new(|_, _| Ok(Vec::new())),
+        interval: web::INTERVAL,
+    };
+    let mut operation = Operation::new(
+        &endpoint,
+        &link,
+        dir.path().to_path_buf(),
+        SignedDuration::from_mins(1),
+    );
+
+    assert!(!operation.paused(clock.as_ref()), "初回の失敗で停止した");
+    clock.sleep(Duration::from_secs(59));
+    assert!(
+        !operation.paused(clock.as_ref()),
+        "失敗から1分経つ前に停止を読んだ"
+    );
+    assert_eq!(transport.reads(), 1, "失敗から1分経つ前に読み直した");
+    clock.sleep(Duration::from_secs(1));
+    assert!(
+        operation.paused(clock.as_ref()),
+        "失敗から1分後に停止を読まなかった"
+    );
+    assert_eq!(
+        crate::operation::load(dir.path()).expect("保存した設定を読めなかった"),
+        Some(crate::operation::Saved {
+            agents: std::collections::BTreeMap::new(),
+            paused: true,
+            read_at: Timestamp::from_second(80).expect("時刻にできなかった")
+        }),
+        "応答を読み終えた時刻を記録していない"
+    );
+}
+
+/// 引数argsに、続けて並んだ値wantがあるかを返す。
+fn has_args(args: &[String], want: &[&str]) -> bool {
+    args.windows(want.len()).any(|window| window == want)
+}
+
+/// 実装と、1回目のレビュー (Approve) のセッションの作業。
+fn implement_and_review(root: &Path) -> Vec<Work<'_>> {
+    vec![
+        Box::new(move |wiki: &Wiki| {
+            commit(root, "state.txt");
+            wiki.check("1-1");
+            Some(implemented())
+        }),
+        Box::new(move |_: &Wiki| {
+            review(root, "demo-1-1", 1, "Approve", "");
+            Some(plain())
+        }),
+    ]
+}
+
+#[test]
+fn 奇数回目と偶数回目のレビュアーを同じ設定で起動できる() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    // 実装・1回目のレビュー・修正・2回目のレビューを動かす。
+    let sessions = Sessions::new(&wiki, whole_plan(root).into_iter().take(4).collect());
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let implementer = br#"{"paused": false, "agents": {"implementer": {"agent": "codex", "model": "gpt-5.3-codex", "effort": "high"}}}"#;
+    let reviewers = br#"{"paused": false, "agents": {"reviewer_odd": {"agent": "claude", "model": "claude-opus-5-5", "effort": "xhigh"}, "reviewer_even": {"agent": "claude", "model": "claude-opus-5-5", "effort": "xhigh"}}}"#;
+    // 実装の前に作業者を、1回目のレビューの前にレビュアーを変え、2回目のあとに停止する。
+    let transport = Operated::new(vec![
+        Ok(ok(RUNNING)),
+        Ok(ok(implementer)),
+        Ok(ok(reviewers)),
+        Ok(ok(reviewers)),
+        Ok(ok(reviewers)),
+        Ok(ok(PAUSED)),
+    ]);
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    let commands = sessions.commands();
+    assert_eq!(commands.len(), 4, "起動したセッションの数が違う:\n{out}");
+    let (program, args) = &commands[0];
+    assert_eq!(
+        program, "codex",
+        "作業者の設定のエージェントで起動していない"
+    );
+    assert!(
+        has_args(args, &["-m", "gpt-5.3-codex"])
+            && has_args(args, &["-c", "model_reasoning_effort=high"]),
+        "作業者の設定のモデルとeffortを渡していない: {args:?}"
+    );
+    for (program, args) in &commands[1..] {
+        assert_eq!(
+            program, "claude",
+            "レビュアーの設定のエージェントで起動していない"
+        );
+        assert!(
+            has_args(args, &["--model", "claude-opus-5-5"])
+                && has_args(args, &["--effort", "xhigh"]),
+            "レビュアーの設定のモデルとeffortを渡していない: {args:?}"
+        );
+    }
+    assert!(
+        out.contains("demo: タスク 1-1 の実装を始めます (Codex・gpt-5.3-codex・high)。"),
+        "使うエージェントとモデルとeffortを表示していない:\n{out}"
+    );
+    let state = load(root);
+    let reviewers: Vec<_> = state.tasks[0]
+        .review
+        .reviews
+        .iter()
+        .map(|review| (review.number, review.role))
+        .collect();
+    assert_eq!(
+        reviewers,
+        [(1, Reviewer::Claude), (2, Reviewer::Claude)],
+        "奇数回目と偶数回目のレビューを設定したレビュアーとして記録していない"
+    );
+    let first = &state.sessions[0];
+    assert_eq!(
+        (
+            first.agent.as_str(),
+            first.model.as_deref(),
+            first.effort.as_deref()
+        ),
+        ("codex", Some("gpt-5.3-codex"), Some("high")),
+        "使ったエージェントの設定を記録していない"
+    );
+    let saved = crate::operation::load(root)
+        .expect("最後に読めた設定を読めなかった")
+        .expect("最後に読めた設定が無い");
+    assert!(
+        saved.paused && saved.agents.is_empty(),
+        "agentsの無い応答を読んだあとに、すべての枠を既定に戻した設定を書いていない: {saved:?}"
+    );
+    assert!(warnings.is_empty(), "読めたのに警告を出した: {warnings:?}");
+}
+
+#[test]
+fn 実行中に変えたエージェントの設定は同じ枠の次回起動から使う() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let initial = br#"{"paused": false, "agents": {"implementer": {"agent": "claude", "model": "model-before", "effort": "low"}}}"#;
+    let updated = br#"{"paused": false, "agents": {"implementer": {"agent": "codex", "model": "model-after", "effort": "high"}}}"#;
+    let transport = Operated::new(vec![Ok(ok(initial))]);
+    let reads_at_launch = Cell::new(0);
+    let sessions = Sessions::new(
+        &wiki,
+        vec![
+            Box::new(|_: &Wiki| {
+                reads_at_launch.set(transport.reads());
+                *transport.settings.lock().expect("設定を変更できなかった") =
+                    VecDeque::from([Ok(ok(updated))]);
+                let state = load(root);
+                let running = state.sessions.last().expect("実行中の記録が無い");
+                assert!(running.is_open(), "実行中の記録が閉じている");
+                assert_eq!(
+                    (
+                        running.agent.as_str(),
+                        running.model.as_deref(),
+                        running.effort.as_deref()
+                    ),
+                    ("claude", Some("model-before"), Some("low")),
+                    "実行中の記録が変更後の設定に変わった"
+                );
+                Some(json!({"needs_human": "確認してください", "verification": []}))
+            }),
+            question(),
+        ],
+    );
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(2, &cancel);
+    clock.on_first_sleep(|| {
+        assert_eq!(
+            transport.reads(),
+            reads_at_launch.get(),
+            "実行中から人間待ちに入るまでに設定を読み直した"
+        );
+        resume_question(root, &wiki);
+    });
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    let commands = sessions.commands();
+    let [(first, first_args), (second, second_args)] = commands.as_slice() else {
+        panic!("同じ枠を2回起動しなかった:\n{out}");
+    };
+    assert_eq!(first, "claude", "最初のエージェントが違う");
+    assert!(
+        has_args(first_args, &["--model", "model-before"])
+            && has_args(first_args, &["--effort", "low"]),
+        "最初のモデルかeffortが違う: {first_args:?}"
+    );
+    assert_eq!(second, "codex", "変更後のエージェントで起動していない");
+    assert!(
+        has_args(second_args, &["-m", "model-after"])
+            && has_args(second_args, &["-c", "model_reasoning_effort=high"]),
+        "変更後のモデルかeffortを渡していない: {second_args:?}"
+    );
+    let state = load(root);
+    let recorded: Vec<_> = state
+        .sessions
+        .iter()
+        .map(|session| {
+            (
+                session.agent.as_str(),
+                session.model.as_deref(),
+                session.effort.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            ("claude", Some("model-before"), Some("low")),
+            ("codex", Some("model-after"), Some("high")),
+        ],
+        "実際に起動した設定を記録していない"
+    );
+    assert!(
+        warnings.is_empty(),
+        "設定を読めたのに警告を出した: {warnings:?}"
+    );
+}
+
+#[test]
+fn 規則に合わない枠は警告して最後に読めたその枠の値を使い_不正な値を引数に渡さない() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(&wiki, implement_and_review(root));
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let valid = br#"{"paused": false, "agents": {"implementer": {"agent": "codex", "model": "gpt-5.3-codex"}}}"#;
+    let invalid = br#"{"paused": false, "agents": {"implementer": {"agent": "codex", "model": "--yolo"}, "reviewer_odd": {"agent": "codex", "effort": "-c x=1"}}}"#;
+    let transport = Operated::new(vec![
+        Ok(ok(valid)),
+        Ok(ok(invalid)),
+        Ok(ok(invalid)),
+        Ok(ok(PAUSED)),
+    ]);
+
+    let (out, warnings) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    let commands = sessions.commands();
+    assert_eq!(commands.len(), 2, "起動したセッションの数が違う:\n{out}");
+    let (program, args) = &commands[0];
+    assert_eq!(
+        program, "codex",
+        "最後に読めた作業者のエージェントを使っていない"
+    );
+    assert!(
+        has_args(args, &["-m", "gpt-5.3-codex"]),
+        "最後に読めた作業者のモデルを使っていない: {args:?}"
+    );
+    let (program, args) = &commands[1];
+    assert_eq!(
+        program, "codex",
+        "奇数回目のレビュアーを既定のエージェントにしなかった"
+    );
+    assert!(
+        !has_args(args, &["-c"]),
+        "検証を通らないeffortを引数に渡した: {args:?}"
+    );
+    for (_, args) in &commands {
+        assert!(
+            args.iter()
+                .all(|arg| !arg.contains("yolo") && !arg.contains("x=1")),
+            "検証を通らない値を引数に渡した: {args:?}"
+        );
+    }
+    assert_eq!(
+        warnings,
+        [
+            "ウェブアプリの担当ごとのエージェントの設定 (作業者) を使えません: モデルは英数字で始め、英数字と . _ - : [ ] だけを使って64文字以内にしてください。最後に読めたこの枠の設定に従います",
+            "ウェブアプリの担当ごとのエージェントの設定 (レビュアー (奇数回目)) を使えません: effortは low・medium・high・xhigh・max のどれかにしてください。既定のエージェントで動かします",
+        ],
+        "同じ理由の警告を繰り返したか、警告が違う"
+    );
+}
+
+#[test]
+fn ウェブアプリに届かないときは最後に読めた担当ごとのエージェントに従う() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let mut saved = crate::operation::Saved {
+        agents: std::collections::BTreeMap::new(),
+        paused: false,
+        read_at: "2026-11-16T00:00:00Z".parse().expect("時刻を読めなかった"),
+    };
+    saved.agents.insert(
+        korylusfactory_protocol::Slot::Implementer,
+        korylusfactory_protocol::AgentSetting {
+            agent: korylusfactory_protocol::Agent::Codex,
+            model: None,
+            effort: Some(korylusfactory_protocol::Effort::Low),
+        },
+    );
+    crate::operation::save(root, &saved).expect("最後に読めた設定を書けなかった");
+    let sessions = Sessions::new(&wiki, vec![question()]);
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let transport = Operated::new(vec![Err("接続できません".to_owned())]);
+
+    let (out, _) = run_operating(root, &wiki, &sessions, &clock, &NoQueue, &transport);
+
+    let commands = sessions.commands();
+    assert_eq!(commands.len(), 1, "起動したセッションの数が違う:\n{out}");
+    let (program, args) = &commands[0];
+    assert_eq!(
+        program, "codex",
+        "最後に読めた作業者のエージェントを使っていない"
+    );
+    assert!(
+        has_args(args, &["-c", "model_reasoning_effort=low"]),
+        "最後に読めた作業者のeffortを使っていない: {args:?}"
+    );
+}
+
+/// 最初のセッションで決めた出力を書いて失敗し、以降はsessionsに任せるLauncher。
+struct FailFirst<'s, 'a> {
+    sessions: &'s Sessions<'a>,
+    stdout: &'static str,
+    stderr: &'static str,
+    failed: Cell<bool>,
+    /// 起動したコマンドと引数。
+    commands: RefCell<Vec<(String, Vec<String>)>>,
+}
+
+impl Launcher for FailFirst<'_, '_> {
+    fn launch(&self, session: &Session, cancel: &AtomicBool) -> Result<Ended, process::Error> {
+        self.commands.borrow_mut().push((
+            session.program.clone(),
+            session
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        ));
+        if self.failed.replace(true) {
+            return self.sessions.launch(session, cancel);
+        }
+        fs::write(&session.stdout, self.stdout).expect("標準出力を書けなかった");
+        fs::write(&session.stderr, self.stderr).expect("標準エラーを書けなかった");
+        Ok(Ended::Exited(1))
+    }
+}
+
+#[test]
+fn 設定した値をcliが受け付けなければやり直さずに人間を待ち_再開すると読み直した設定で起動する() {
+    let (repo, wiki) = web_project();
+    let root = repo.root.as_path();
+    let sessions = Sessions::new(
+        &wiki,
+        vec![Box::new(move |wiki: &Wiki| {
+            commit(root, "state.txt");
+            wiki.check("1-1");
+            Some(implemented())
+        })],
+    );
+    let launcher = FailFirst {
+        sessions: &sessions,
+        stdout: r#"{"is_error": true, "result": "There's an issue with the selected model (no-such-model)."}"#,
+        stderr: "[claude-code:unrecognized_model] {\"model\":\"no-such-model\"}\n",
+        failed: Cell::new(false),
+        commands: RefCell::new(Vec::new()),
+    };
+    let wrong = br#"{"paused": false, "agents": {"implementer": {"agent": "claude", "model": "no-such-model"}}}"#;
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let transport = Operated::new(vec![Ok(ok(wrong))]);
+
+    let (out, _) = run_operating(root, &wiki, &launcher, &clock, &NoQueue, &transport);
+
+    assert_eq!(
+        launcher.commands.borrow().len(),
+        1,
+        "値を拒まれたセッションをやり直した:\n{out}"
+    );
+    let state = load(root);
+    let wait = state.wait.clone().expect("人間を待っていない");
+    assert_eq!(
+        wait.kind,
+        WaitKind::AgentSettings,
+        "人間を待つ場面が違う: {out}"
+    );
+    assert_eq!(
+        state.step,
+        Some(Step::Implement),
+        "同じステップのまま待っていない"
+    );
+    assert_eq!(state.retries, 0, "値を拒まれた失敗をやり直しの回数に数えた");
+    assert_eq!(
+        wait.details[..2],
+        [
+            "作業者: Claude Code・no-such-model・既定のeffort".to_owned(),
+            "CLIの出力: [claude-code:unrecognized_model] {\"model\":\"no-such-model\"}".to_owned(),
+        ],
+        "枠と使った値とCLIの文面を待っている理由に書いていない"
+    );
+    assert_eq!(
+        state.sessions.last().and_then(|session| session.result),
+        Some(SessionResult::SettingsRejected),
+        "セッションの記録の結果に残していない"
+    );
+
+    resume_question(root, &wiki);
+    let fixed = br#"{"paused": false, "agents": {"implementer": {"agent": "claude", "model": "claude-opus-5-5"}}}"#;
+    let cancel = AtomicBool::new(false);
+    let clock = Clock::new(1, &cancel);
+    let transport = Operated::new(vec![Ok(ok(fixed)), Ok(ok(PAUSED))]);
+
+    let (out, _) = run_operating(root, &wiki, &launcher, &clock, &NoQueue, &transport);
+
+    let commands = launcher.commands.borrow().clone();
+    assert_eq!(commands.len(), 2, "再開したあとに起動していない:\n{out}");
+    assert!(
+        has_args(&commands[1].1, &["--model", "claude-opus-5-5"]),
+        "再開したあとに読み直した設定で起動していない: {:?}",
+        commands[1].1
+    );
+    assert_eq!(
+        load(root).step,
+        Some(Step::Review),
+        "再開したあとに同じステップを終えていない"
+    );
+}
+
+#[test]
+fn codexの設定と無関係な失敗は同じステップをやり直す() {
+    let configured = br#"{"paused": false, "agents": {"implementer": {"agent": "codex", "model": "gpt-5.3-codex", "effort": "max"}}}"#;
+    let cases = [
+        (
+            "APIの別の項目の列挙値エラー",
+            r#"{"type":"error","message":"[tools.0.type] [invalid_enum_value] Invalid value."}"#,
+        ),
+        (
+            "通常の出力にモデル拒否の文面があった後のレート制限",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Tested the diagnostic: model is not supported."}}
+{"type":"error","message":"rate limited"}"#,
+        ),
+    ];
+    for (case, stdout) in cases {
+        let (repo, wiki) = web_project();
+        let root = repo.root.as_path();
+        let sessions = Sessions::new(&wiki, vec![question()]);
+        let launcher = FailFirst {
+            sessions: &sessions,
+            stdout,
+            stderr: "",
+            failed: Cell::new(false),
+            commands: RefCell::new(Vec::new()),
+        };
+        let cancel = AtomicBool::new(false);
+        let clock = Clock::new(2, &cancel);
+        let transport = Operated::new(vec![Ok(ok(configured))]);
+
+        let (out, _) = run_operating(root, &wiki, &launcher, &clock, &NoQueue, &transport);
+
+        let state = load(root);
+        let sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|session| (session.step, session.result))
+            .collect();
+        assert_eq!(
+            sessions,
+            [
+                (Step::Implement, Some(SessionResult::Unfinished)),
+                (Step::Implement, Some(SessionResult::Asked)),
+            ],
+            "{case}のあとに同じステップをやり直さなかった:\n{out}"
+        );
+        assert_eq!(
+            clock.sleeps().first(),
+            Some(&Timing::default().retry),
+            "{case}のあとにやり直しの間隔を空けなかった"
+        );
+    }
 }

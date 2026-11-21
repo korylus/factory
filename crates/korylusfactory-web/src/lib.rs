@@ -3,6 +3,7 @@
 //! 各プロジェクトのディレクターが送る状態を受け取り、人間に一覧で見せる。
 //! exe.devの認証付きのプロキシの内側で動き、プロキシが付けるヘッダーで要求の主を見分ける ([`auth`])。
 
+pub mod agents;
 pub mod api;
 pub mod app;
 pub mod assets;
@@ -12,6 +13,7 @@ pub mod db;
 pub mod events;
 pub mod page;
 pub mod projects;
+pub mod settings;
 
 /// エラーを、原因をたどって1行にまとめる。
 pub fn describe(err: &dyn std::error::Error) -> String {

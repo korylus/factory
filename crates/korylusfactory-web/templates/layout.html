@@ -10,6 +10,7 @@
     <link rel="icon" href="data:," />
     <meta name="htmx-config" content='{"includeIndicatorCSS": false}' />
     <link rel="stylesheet" href="{{ crate::assets::stylesheet_path() }}" />
+    {% block scripts %}{% endblock %}
     <script src="{{ crate::assets::htmx_path() }}" defer></script>
     <script src="{{ crate::assets::sse_path() }}" defer></script>
   </head>

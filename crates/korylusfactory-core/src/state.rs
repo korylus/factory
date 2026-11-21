@@ -12,6 +12,7 @@
 
 mod item;
 mod record;
+mod session;
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
@@ -28,6 +29,7 @@ pub use record::{
     DeferredFinding, HumanFinding, HumanReview, ReviewRecord, ReviewTrail, Reviewer, TaskRecord,
     Verdict, VerificationItem, VerificationKind,
 };
+pub use session::{SessionAgent, SessionRecord, SessionResult, Slot};
 
 /// プロジェクトのルートからの、状態を置くディレクトリの相対パス。
 pub const ROOT: &str = "docs/private/factory/plans";
@@ -190,6 +192,11 @@ pub struct PlanState {
     /// 通知のコマンドで最後に知らせた人間待ち。同じ待ちを、通知のコマンドで繰り返し知らせないために使う。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notified: Option<Notified>,
+    /// 起動したセッションの記録。起動した順に並べる。
+    ///
+    /// この項目の無い状態ファイル (前の版のkorylusfactoryやkorylusflowが書いたもの) は、空として読む。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionRecord>,
 }
 
 /// 作業報告書1回分の記録。
@@ -231,6 +238,7 @@ impl PlanState {
             report_rounds: Vec::new(),
             items: Vec::new(),
             notified: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -365,6 +373,8 @@ pub enum WaitKind {
     ReviewLimit,
     /// 同じステップのやり直しが、上限の回数に達した。
     RetryLimit,
+    /// 担当ごとのエージェントの設定 (モデルかeffort) を、セッションのCLIが受け付けなかった。
+    AgentSettings,
     /// セッションが、人間の判断が要ると返して終わった。
     Question,
     /// 作業報告書を、人間が確認する。
@@ -380,6 +390,7 @@ impl WaitKind {
             WaitKind::Review => "レビューの要人間判断の指摘",
             WaitKind::ReviewLimit => "レビューの上限",
             WaitKind::RetryLimit => "やり直しの上限",
+            WaitKind::AgentSettings => "エージェントの設定",
             WaitKind::Question => "セッションからの質問",
             WaitKind::Report => "作業報告書の確認",
         }
@@ -739,7 +750,48 @@ mod tests {
                 },
                 url: Some("https://wikino.app/s/shimbaco/pages/30/edit".to_owned()),
             }),
+            sessions: sample_sessions(),
         }
+    }
+
+    /// 終わったレビューのセッションと、実行中の再レビューのセッションの記録。
+    fn sample_sessions() -> Vec<SessionRecord> {
+        vec![
+            SessionRecord {
+                task: Some("1-2".to_owned()),
+                step: Step::Review,
+                review: Some(1),
+                slot: Slot::ReviewerOdd,
+                agent: "codex".to_owned(),
+                model: Some("gpt-5.3-codex".to_owned()),
+                effort: Some("high".to_owned()),
+                started_at: "2026-11-16T03:40:00Z"
+                    .parse()
+                    .expect("日時を読み取れなかった"),
+                ended_at: Some(
+                    "2026-11-16T04:00:00Z"
+                        .parse()
+                        .expect("日時を読み取れなかった"),
+                ),
+                result: Some(SessionResult::Recorded),
+                verdict: Some(Verdict::RequestChanges),
+            },
+            SessionRecord {
+                task: Some("1-2".to_owned()),
+                step: Step::Review,
+                review: Some(2),
+                slot: Slot::ReviewerEven,
+                agent: "claude".to_owned(),
+                model: None,
+                effort: None,
+                started_at: "2026-11-16T04:10:00Z"
+                    .parse()
+                    .expect("日時を読み取れなかった"),
+                ended_at: None,
+                result: None,
+                verdict: None,
+            },
+        ]
     }
 
     #[test]
@@ -843,6 +895,45 @@ mod tests {
             .expect("既存の状態を読めなかった")
             .expect("状態が無い");
         assert!(!state.session_started, "既存の状態を実行中にした");
+        assert!(
+            state.sessions.is_empty(),
+            "セッションの記録の無い状態を空として読まなかった"
+        );
+    }
+
+    #[test]
+    fn セッションの記録は枠と結果を小文字の値で評価をレビュードキュメントの表記で書く() {
+        let value = serde_json::to_value(sample()).expect("状態をJSONにできなかった");
+
+        assert_eq!(
+            value["sessions"][0],
+            serde_json::json!({
+                "task": "1-2",
+                "step": "review",
+                "review": 1,
+                "slot": "reviewer_odd",
+                "agent": "codex",
+                "model": "gpt-5.3-codex",
+                "effort": "high",
+                "started_at": "2026-11-16T03:40:00Z",
+                "ended_at": "2026-11-16T04:00:00Z",
+                "result": "recorded",
+                "verdict": "Request Changes"
+            }),
+            "終わったセッションの記録の形が違う"
+        );
+        assert_eq!(
+            value["sessions"][1],
+            serde_json::json!({
+                "task": "1-2",
+                "step": "review",
+                "review": 2,
+                "slot": "reviewer_even",
+                "agent": "claude",
+                "started_at": "2026-11-16T04:10:00Z"
+            }),
+            "実行中のセッションの記録で、無い値のキーを省かなかった"
+        );
     }
 
     #[test]

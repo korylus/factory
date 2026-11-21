@@ -11,7 +11,7 @@ use korylusfactory_cli::human_queue::{WikinoStore, command as queue};
 use korylusfactory_cli::process::System;
 use korylusfactory_cli::start::{self, Start, SystemClock, Timing};
 use korylusfactory_cli::version::{self, Build};
-use korylusfactory_cli::{completion, config, describe, resume, roadmap, status, web};
+use korylusfactory_cli::{completion, config, describe, operation, resume, roadmap, status, web};
 use korylusfactory_core::state::{Store, Wait, WaitKind};
 
 /// バージョン番号に、ビルド元のコミットとビルドした日を添えた文字列。
@@ -183,6 +183,21 @@ fn run_status(json: bool) -> Result<(), Box<dyn Error>> {
     }
     let root = env::current_dir()?;
     let config = config::load(&root)?;
+    // 最後に読めた設定を読めないときも、ほかの表示は続ける。
+    let saved = if config.web.is_some() {
+        operation::load(&root).unwrap_or_else(|err| {
+            eprintln!("korylusfactory: {}", describe(&err));
+            None
+        })
+    } else {
+        None
+    };
+    if !json {
+        let time_zone = TimeZone::system();
+        stdout.write_all(status::operation_text(saved.as_ref(), &time_zone).as_bytes())?;
+        stdout.write_all(status::agents_text(saved.as_ref(), &time_zone).as_bytes())?;
+        stdout.flush()?;
+    }
     let store = Store::new(&root);
     let entries = roadmap::load(&runner, &config, &store)?;
     let progress: Vec<status::Progress> = store
@@ -208,7 +223,7 @@ fn run_status(json: bool) -> Result<(), Box<dyn Error>> {
     if json {
         serde_json::to_writer_pretty(
             &mut stdout,
-            &status::Report::new(&build, &freshness, &entries, &progress),
+            &status::Report::new(&build, &freshness, saved.as_ref(), &entries, &progress),
         )?;
         stdout.write_all(b"\n")?;
     } else {

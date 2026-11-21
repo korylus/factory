@@ -30,7 +30,11 @@ pub fn resume_with(
     let wait = state.wait.clone().ok_or(Error::NotWaiting)?;
     let mut resumed = state.clone();
     match wait.kind {
-        WaitKind::HumanTask | WaitKind::Branch | WaitKind::RetryLimit | WaitKind::Report => {
+        WaitKind::HumanTask
+        | WaitKind::Branch
+        | WaitKind::RetryLimit
+        | WaitKind::AgentSettings
+        | WaitKind::Report => {
             resume(&mut resumed, doc, project, None)?;
         }
         WaitKind::ReviewLimit => {

@@ -12,11 +12,13 @@ use std::sync::atomic::AtomicBool;
 
 use jiff::Timestamp;
 use korylusfactory_core::flow::{self, Fixed, Implemented, Next, RETRY_LIMIT, Reported, Retry};
-use korylusfactory_core::state::{PlanDir, PlanState};
+use korylusfactory_core::state::{PlanDir, PlanState, SessionResult};
+use korylusfactory_protocol::AgentSetting;
 
 use super::{Director, EXCLUDED, Error, Pace, SESSION_LOCK_PATH, describe_next, minutes};
 use crate::agent::{self, Outcome, Response};
 use crate::instruction::{self, Agent, Context, Request};
+use crate::operation::slot_label;
 use crate::process::Exclusive;
 use crate::{branch, describe};
 
@@ -30,7 +32,7 @@ pub(super) struct Launch {
 }
 
 impl Launch {
-    /// 状態の置き場dirの作業計画書で、状態stateの次に行うことnextのセッションへの指示と、記録のディレクトリを用意する。
+    /// 状態の置き場dirの作業計画書で、状態stateの次に行うことnextのセッションへの、枠の設定settingで頼む指示と、記録のディレクトリを用意する。
     ///
     /// 記録のディレクトリの名前は、現在の日時nowから決める。セッションを起動しないステップなら `None` を返す。
     pub(super) fn new(
@@ -38,6 +40,7 @@ impl Launch {
         state: &PlanState,
         next: &Next,
         now: Timestamp,
+        setting: &AgentSetting,
     ) -> Result<Option<Self>, Error> {
         let state_path = dir.state_path();
         let context = Context {
@@ -46,7 +49,7 @@ impl Launch {
             retry: &state.retry_reasons,
             answers: &state.answers,
         };
-        let Some(request) = instruction::build(next, state, &context)? else {
+        let Some(request) = instruction::build(next, state, &context, setting)? else {
             return Ok(None);
         };
         let logs = logs_dir(dir.path(), next, now)?;
@@ -56,7 +59,8 @@ impl Launch {
 
 /// 計画書名nameの作業計画書で、状態stateの次に行うことnextのセッションを、用意したlaunchで起動し、結果を記録する。
 ///
-/// 状態の置き場dirの下で状態を読み直して記録する。cancelが真になったら、セッションを終わらせて記録せずに戻る。
+/// 状態の置き場dirの下で状態を読み直して記録する。cancelが真になったら、セッションを終わらせて取り消しを記録する。
+/// 進行の更新とセッションの記録は、同じロックの中で保存する。
 pub(super) fn run(
     director: &mut Director<'_, '_>,
     dir: &PlanDir,
@@ -70,7 +74,9 @@ pub(super) fn run(
     director.say(&format!(
         "{name}: {}を始めます ({})。記録: {}",
         describe_next(next),
-        label(request.agent),
+        request
+            .agent
+            .setting_label(request.model.as_ref(), request.effort),
         logs.display()
     ))?;
     let start = director.start;
@@ -84,27 +90,44 @@ pub(super) fn run(
         start.timing.session,
         cancel,
     ) {
-        Ok(Outcome::Cancelled) => return Ok(Pace::Continue),
         Ok(outcome) => outcome,
         // 起動できないときも、原因を取り除くまで繰り返さないよう、途中で止まったものとしてやり直しの回数に数える。
         Err(err) => Outcome::Stopped(describe(&err)),
     };
+    // 状態ファイルのロックを待つ時間を所要時間に含めないよう、ロックを取る前に終わった時刻を採る。
+    let ended_at = start.clock.now();
 
     let lock = dir.lock()?;
     let Some(mut current) = lock.load()? else {
         return Ok(Pace::Continue);
     };
-    if current.wait.is_some() || current.task != state.task || current.step != state.step {
-        drop(lock);
-        director.say(&format!(
-            "{name}: セッションの間に状態が変わったため、{}の結果を記録しません",
-            describe_next(next)
-        ))?;
-        return Ok(Pace::Continue);
-    }
     let reasons = match outcome {
+        Outcome::Cancelled => {
+            // 開始の印は残し、次に起動したセッションへ中断を伝える。
+            flow::end_session(&mut current, SessionResult::Cancelled, ended_at);
+            lock.save(&current)?;
+            return Ok(Pace::Continue);
+        }
+        _ if current.wait.is_some() || current.task != state.task || current.step != state.step => {
+            flow::end_session(&mut current, SessionResult::Stale, ended_at);
+            lock.save(&current)?;
+            drop(lock);
+            director.say(&format!(
+                "{name}: セッションの間に状態が変わったため、{}の結果を記録しません",
+                describe_next(next)
+            ))?;
+            return Ok(Pace::Continue);
+        }
         Outcome::NeedsHuman(question) => {
             flow::ask(&mut current, question)?;
+            flow::end_session(&mut current, SessionResult::Asked, ended_at);
+            lock.save(&current)?;
+            return Ok(Pace::Continue);
+        }
+        Outcome::Rejected(text) => {
+            let details = rejected_details(next, &request, &text, &logs);
+            flow::reject_settings(&mut current, details)?;
+            flow::end_session(&mut current, SessionResult::SettingsRejected, ended_at);
             lock.save(&current)?;
             return Ok(Pace::Continue);
         }
@@ -112,8 +135,9 @@ pub(super) fn run(
         Outcome::Done(response) => {
             // 確かめる途中で失敗しても状態を書きかけにしないよう、写しに記録する。
             let mut finished = current.clone();
-            match finish(director, &mut finished, next, response) {
+            match finish(director, &mut finished, next, response, request.agent) {
                 Ok(()) => {
+                    flow::end_session(&mut finished, SessionResult::Recorded, ended_at);
                     lock.save(&finished)?;
                     drop(lock);
                     director.say(&format!("{name}: {}を記録しました", describe_next(next)))?;
@@ -124,9 +148,9 @@ pub(super) fn run(
                 Err(err) => vec![describe(&err)],
             }
         }
-        Outcome::Cancelled => return Ok(Pace::Continue),
     };
     let retried = flow::retry(&mut current, reasons.clone(), RETRY_LIMIT)?;
+    flow::end_session(&mut current, SessionResult::Unfinished, ended_at);
     lock.save(&current)?;
     drop(lock);
     match retried {
@@ -148,11 +172,14 @@ pub(super) fn run(
 }
 
 /// セッションが返した結果responseとリポジトリの状態を確かめ、次に行うことnextの完了を状態stateに記録する。
+///
+/// レビューは、セッションを動かしたエージェントagentのレビュアーが行ったものとして記録する。
 fn finish(
     director: &Director<'_, '_>,
     state: &mut PlanState,
     next: &Next,
     response: Response,
+    agent: Agent,
 ) -> Result<(), Error> {
     let runner = director.start.runner;
     let project = &director.project;
@@ -173,7 +200,7 @@ fn finish(
             flow::finish_work(state, &doc)?;
         }
         Next::Review { .. } | Next::ReportReview { .. } => {
-            flow::finish_review(state, project, director.start.clock.now())?;
+            flow::finish_review(state, project, director.start.clock.now(), agent.reviewer())?;
         }
         Next::Fix { task, .. } => {
             let doc = director.read_plan(&state.url)?;
@@ -248,10 +275,21 @@ fn slug(next: &Next) -> String {
     }
 }
 
-/// エージェントagentの表示名を返す。
-fn label(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Claude => "Claude Code",
-        Agent::Codex => "Codex",
-    }
+/// 次に行うことnextのセッションで、頼むことrequestの値をCLIが拒んだときの、人間待ちの理由の詳細を返す。
+///
+/// 担当の呼び名と使った値に、CLIが値を拒んだ文面text (セッションから来たデータ) と、記録のディレクトリlogsを添える。
+fn rejected_details(next: &Next, request: &Request, text: &str, logs: &Path) -> Vec<String> {
+    let slot = next.slot().map_or("セッション", |slot| {
+        slot_label(instruction::protocol_slot(slot))
+    });
+    vec![
+        format!(
+            "{slot}: {}",
+            request
+                .agent
+                .setting_label(request.model.as_ref(), request.effort)
+        ),
+        format!("CLIの出力: {text}"),
+        format!("記録: {}", logs.display()),
+    ]
 }

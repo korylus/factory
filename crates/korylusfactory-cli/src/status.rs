@@ -1,13 +1,18 @@
 //! `korylusfactory status` の表示。
 //!
-//! korylusfactoryのバージョンと古いかどうか、これから進める作業計画書の並び、進行中の作業計画書を、文章かJSONで書く。
+//! korylusfactoryのバージョンと古いかどうか、ウェブアプリの設定で停止しているか、これから進める作業計画書の並び、進行中の作業計画書を、文章かJSONで書く。
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use jiff::tz::TimeZone;
 use korylusfactory_core::state::{ItemPage, PlanState, Step, Wait};
+use korylusfactory_protocol::{AgentEntry, Slot};
 use serde::Serialize;
 
 use crate::completion::{Completion, Unmerged};
+use crate::instruction::Agent;
+use crate::operation::{Saved, slot_label};
 use crate::roadmap::{Entry, State};
 use crate::version::{Build, Compared, Freshness};
 
@@ -46,6 +51,47 @@ pub fn version_diagnostics(build: &Build, freshness: &Freshness) -> String {
     } = freshness
     {
         out.push_str("リモートの main を取得できなかったため、手元の main と比べました\n");
+    }
+    out
+}
+
+/// 最後に読めた稼働の設定savedが停止を示していれば、停止中であることと、いつ読んだ設定かを表す行を返す。
+/// 停止を示していなければ空文字列を返す。時刻はtime_zoneで書く。
+pub fn operation_text(saved: Option<&Saved>, time_zone: &TimeZone) -> String {
+    match saved {
+        Some(saved) if saved.paused => format!(
+            "ウェブアプリの設定で停止しています ({}に読んだ設定)。稼働に戻されるまで、次の作業を始めません\n",
+            saved
+                .read_at
+                .to_zoned(time_zone.clone())
+                .strftime("%Y-%m-%d %H:%M")
+        ),
+        _ => String::new(),
+    }
+}
+
+/// 最後に読めた設定savedの担当ごとのエージェントを、枠ごとに1行ずつ表す行を返す。
+///
+/// 設定を読めていなければ空文字列を返す。載っていない枠は既定を出す。時刻はtime_zoneで書く。
+pub fn agents_text(saved: Option<&Saved>, time_zone: &TimeZone) -> String {
+    let Some(saved) = saved else {
+        return String::new();
+    };
+    let mut out = format!(
+        "担当ごとのエージェント ({}に読んだ設定):\n",
+        saved
+            .read_at
+            .to_zoned(time_zone.clone())
+            .strftime("%Y-%m-%d %H:%M")
+    );
+    for slot in Slot::ALL {
+        let setting = saved.agent(slot);
+        let _ = writeln!(
+            out,
+            "  {}: {}",
+            slot_label(slot),
+            Agent::from(setting.agent).setting_label(setting.model.as_ref(), setting.effort),
+        );
     }
     out
 }
@@ -242,10 +288,20 @@ impl<'a> UnmergedJson<'a> {
 pub struct Report<'a> {
     /// korylusfactoryのバージョンと、古いかどうか。
     korylusfactory: VersionJson<'a>,
+    /// 最後に読めた稼働の設定。ウェブアプリを設定していないか、まだ読めていなければ `null`。
+    operation: Option<OperationJson>,
     /// これから進める作業計画書。進める順に並べる。
     plans: Vec<PlanJson<'a>>,
     /// 進め始めて、まだ完了を記録していない作業計画書。計画書名の順に並べる。
     progress: Vec<ProgressJson<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationJson {
+    paused: bool,
+    /// 担当ごとのエージェント。すべての枠を、載っていない枠は既定にして出す。
+    agents: BTreeMap<&'static str, AgentEntry>,
+    read_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,10 +339,11 @@ enum StateJson<'a> {
 }
 
 impl<'a> Report<'a> {
-    /// ビルド元の情報build・古いかどうかfreshness・作業計画書の並びentries・進行中の作業計画書progressから、JSONの出力を作る。
+    /// ビルド元の情報build・古いかどうかfreshness・最後に読めた稼働の設定saved・作業計画書の並びentries・進行中の作業計画書progressから、JSONの出力を作る。
     pub fn new(
         build: &'a Build,
         freshness: &'a Freshness,
+        saved: Option<&Saved>,
         entries: &'a [Entry],
         progress: &'a [Progress],
     ) -> Self {
@@ -321,6 +378,14 @@ impl<'a> Report<'a> {
                 source_dir: build.source_dir.display().to_string(),
                 freshness,
             },
+            operation: saved.map(|saved| OperationJson {
+                paused: saved.paused,
+                agents: Slot::ALL
+                    .into_iter()
+                    .map(|slot| (slot.value(), saved.agent(slot).to_entry()))
+                    .collect(),
+                read_at: saved.read_at.to_string(),
+            }),
             plans,
             progress: progress.iter().map(ProgressJson::new).collect(),
         }
@@ -449,7 +514,7 @@ mod tests {
                 expected.as_bytes(),
                 "パスが変わった: {path:?}"
             );
-            let json = serde_json::to_value(Report::new(&build, &freshness, &[], &[]))
+            let json = serde_json::to_value(Report::new(&build, &freshness, None, &[], &[]))
                 .expect("JSONにできなかった");
             assert_eq!(
                 json["korylusfactory"]["source_dir"], path,
@@ -508,7 +573,7 @@ mod tests {
             latest: "def5678".to_owned(),
         };
         let entries = entries();
-        let json = serde_json::to_value(Report::new(&build, &freshness, &entries, &[]))
+        let json = serde_json::to_value(Report::new(&build, &freshness, None, &entries, &[]))
             .expect("JSONにできなかった");
         assert_eq!(
             json,
@@ -520,6 +585,7 @@ mod tests {
                     "source_dir": "/korylus-tools",
                     "freshness": {"state": "stale", "compared": "main", "latest": "def5678"},
                 },
+                "operation": null,
                 "plans": [
                     {
                         "section": "やってる",
@@ -550,7 +616,7 @@ mod tests {
         let unknown = Freshness::Unknown {
             reason: "理由".to_owned(),
         };
-        let json = serde_json::to_value(Report::new(&build, &unknown, &[], &[]))
+        let json = serde_json::to_value(Report::new(&build, &unknown, None, &[], &[]))
             .expect("JSONにできなかった");
         assert_eq!(
             json["korylusfactory"]["freshness"],
@@ -669,7 +735,7 @@ mod tests {
             compared: Compared::Remote,
         };
         let progress = progress();
-        let json = serde_json::to_value(Report::new(&build, &freshness, &[], &progress))
+        let json = serde_json::to_value(Report::new(&build, &freshness, None, &[], &progress))
             .expect("JSONにできなかった");
         assert_eq!(
             json["progress"],
@@ -704,5 +770,89 @@ mod tests {
                 },
             ])
         );
+    }
+
+    fn saved(paused: bool) -> Saved {
+        Saved {
+            agents: std::collections::BTreeMap::new(),
+            paused,
+            read_at: "2026-11-19T08:05:30Z".parse().expect("時刻を読めなかった"),
+        }
+    }
+
+    #[test]
+    fn 最後に読めた設定が停止を示していれば停止中といつ読んだ設定かを表示する() {
+        let tokyo = TimeZone::get("Asia/Tokyo").expect("タイムゾーンを読めなかった");
+
+        assert_eq!(
+            operation_text(Some(&saved(true)), &tokyo),
+            "ウェブアプリの設定で停止しています (2026-11-19 17:05に読んだ設定)。稼働に戻されるまで、次の作業を始めません\n",
+            "停止中の表示が違う"
+        );
+        assert_eq!(
+            operation_text(Some(&saved(false)), &tokyo),
+            "",
+            "稼働なのに表示した"
+        );
+        assert_eq!(operation_text(None, &tokyo), "", "読めていないのに表示した");
+    }
+
+    /// 作業者をモデルとeffortを指定したCodexにした、最後に読めた設定。
+    fn saved_with_agent() -> Saved {
+        let mut saved = saved(true);
+        saved.agents.insert(
+            Slot::Implementer,
+            korylusfactory_protocol::AgentSetting {
+                agent: korylusfactory_protocol::Agent::Codex,
+                model: Some(
+                    korylusfactory_protocol::Model::parse("gpt-5.3-codex")
+                        .expect("モデルを読めなかった"),
+                ),
+                effort: Some(korylusfactory_protocol::Effort::High),
+            },
+        );
+        saved
+    }
+
+    #[test]
+    fn 最後に読めた設定をjsonに出し_担当ごとのエージェントは既定を含めてすべての枠を出す() {
+        let build = build();
+        let freshness = Freshness::Unknown {
+            reason: "理由".to_owned(),
+        };
+        let json = serde_json::to_value(Report::new(
+            &build,
+            &freshness,
+            Some(&saved_with_agent()),
+            &[],
+            &[],
+        ))
+        .expect("JSONにできなかった");
+
+        assert_eq!(
+            json["operation"],
+            serde_json::json!({
+                "paused": true,
+                "agents": {
+                    "implementer": {"agent": "codex", "model": "gpt-5.3-codex", "effort": "high"},
+                    "reviewer_odd": {"agent": "codex"},
+                    "reviewer_even": {"agent": "claude"}
+                },
+                "read_at": "2026-11-19T08:05:30Z"
+            }),
+            "最後に読めた設定のJSONが違う"
+        );
+    }
+
+    #[test]
+    fn 最後に読めた担当ごとのエージェントを枠ごとに表示する() {
+        let tokyo = TimeZone::get("Asia/Tokyo").expect("タイムゾーンを読めなかった");
+
+        assert_eq!(
+            agents_text(Some(&saved_with_agent()), &tokyo),
+            "担当ごとのエージェント (2026-11-19 17:05に読んだ設定):\n  作業者: Codex・gpt-5.3-codex・high\n  レビュアー (奇数回目): Codex・既定のモデル・既定のeffort\n  レビュアー (偶数回目): Claude Code・既定のモデル・既定のeffort\n",
+            "担当ごとのエージェントの表示が違う"
+        );
+        assert_eq!(agents_text(None, &tokyo), "", "読めていないのに表示した");
     }
 }

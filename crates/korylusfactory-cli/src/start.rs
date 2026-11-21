@@ -8,12 +8,17 @@
 //! 状態ファイルの読み取りから次のステップの判定・書き込みまでは、1つのファイルロックの中で行う。
 //! セッションの実行中は、ロックを持たない。
 //!
+//! ウェブに報告するプロジェクトでは、作業計画書の開始とブランチの準備・セッションの起動の前に、ウェブアプリから稼働の設定を読む ([`operation`])。
+//! 停止している間は、それらを始めずに待ち、人間待ちの表示や依頼の積み上げ・回答の受け取り・状態の報告は続ける。
+//! 稼働の設定は、作業計画書の状態ファイルのロックを取る前に読む。
+//!
 //! ウェブに報告するプロジェクトでは、実行ファイルから取り消しを受け取り、セッションと送信を終了する。
 //! シグナルの既定動作で終わった場合も、セッションの監督プロセスが子孫まで終わらせる。
 //! 状態はセッションの結果を記録する前のまま残るため、次に起動したときに同じステップをやり直す。
 
 mod alert;
 mod items;
+mod operation;
 mod prepare;
 mod reporting;
 mod session;
@@ -35,7 +40,7 @@ use korylusfactory_core::flow::{self, Next, PlanDocument, Prepared, Project, Tas
 use korylusfactory_core::item::{self, Scene};
 use korylusfactory_core::queue::{self, Head};
 use korylusfactory_core::state::{
-    self, ItemPage, NoticeKind, Notices, PlanState, Store, Wait, WaitKind,
+    self, ItemPage, NoticeKind, Notices, PlanState, SessionAgent, Store, Wait, WaitKind,
 };
 
 use crate::completion::{self, Completion};
@@ -49,6 +54,7 @@ use crate::version::{self, Build, Freshness};
 use crate::web::Link;
 use crate::{agent, branch, describe, instruction, status};
 use alert::TITLE_PREFIX;
+use operation::Operation;
 use reporting::Reporting;
 use session::Launch;
 
@@ -164,6 +170,8 @@ pub struct Timing {
     pub queue: Duration,
     /// 通知のコマンドを終わらせるまでの時間の上限。
     pub notify: Duration,
+    /// ウェブアプリの設定で停止している間と、設定を読めなかったあとに、読み直すまで空ける間隔。
+    pub settings: Duration,
 }
 
 impl Default for Timing {
@@ -175,6 +183,7 @@ impl Default for Timing {
             state: Duration::from_secs(5),
             queue: Duration::from_mins(1),
             notify: notify::DEFAULT_TIMEOUT,
+            settings: Duration::from_mins(1),
         }
     }
 }
@@ -312,10 +321,20 @@ pub fn run_configured(
             }
         }
     });
+    let operation = config.web.as_ref().map(|endpoint| {
+        Operation::new(
+            endpoint,
+            start.web,
+            start.root.to_path_buf(),
+            SignedDuration::try_from(start.timing.settings).unwrap_or(SignedDuration::MAX),
+        )
+    });
     let mut director = Director {
         start,
         config,
         reporting,
+        operation,
+        paused: false,
         project,
         store: Store::new(start.root),
         notices: Notices::new(start.root),
@@ -401,6 +420,10 @@ struct Director<'a, 's> {
     config: Config,
     /// 状態の報告を管制のウェブアプリへ送る。設定に「web」が無ければ `None`。
     reporting: Option<Reporting>,
+    /// 稼働の設定をウェブアプリから読む。設定に「web」が無ければ `None` で、常に稼働として進める。
+    operation: Option<Operation>,
+    /// ウェブアプリの設定で停止したことを反映し、次の作業を始めずに待っているか。
+    paused: bool,
     project: Project,
     store: Store,
     /// 状態ファイルに持たない待ちに積んだ、知らせの項目の記録。
@@ -446,12 +469,21 @@ impl Director<'_, '_> {
             .into_iter()
             .filter(|(_, state)| !state.is_completed())
             .collect();
-        let (name, state) = match active.len() {
-            0 => match self.begin()? {
-                Some(begun) => begun,
-                None => return Ok(Pace::Sleep(self.start.timing.roadmap)),
-            },
-            1 => active.remove(0),
+        // 作業計画書を始める前に稼働の設定を確かめたら、同じ回のセッションの前には読み直さない。
+        let (name, state, checked) = match active.len() {
+            0 => {
+                if self.check_operation()? {
+                    return Ok(Pace::Sleep(self.start.timing.settings));
+                }
+                match self.begin()? {
+                    Some((name, state)) => (name, state, true),
+                    None => return Ok(Pace::Sleep(self.start.timing.roadmap)),
+                }
+            }
+            1 => {
+                let (name, state) = active.remove(0);
+                (name, state, false)
+            }
             _ => {
                 return Err(Error::Ambiguous(
                     active.into_iter().map(|(name, _)| name).collect(),
@@ -470,8 +502,33 @@ impl Director<'_, '_> {
         } else {
             // 作業へ戻ったあと同じ内容で待っても、新しく始まった待ちとしてベルを鳴らす。
             self.rung.clear();
+            if !checked && self.check_operation()? {
+                return Ok(Pace::Sleep(self.start.timing.settings));
+            }
             self.advance(&name, cancel)
         }
+    }
+
+    /// ウェブアプリの稼働の設定を読み、停止していれば真を返す。
+    ///
+    /// 停止と稼働が切り替わったときに、1回だけ表示する。停止している間は、端末のタイトルを停止中にする。
+    fn check_operation(&mut self) -> Result<bool, Error> {
+        let Some(operation) = &mut self.operation else {
+            return Ok(false);
+        };
+        let paused = operation.paused(self.start.clock);
+        if paused != self.paused {
+            self.paused = paused;
+            self.say(if paused {
+                "ウェブアプリの設定で停止しています。稼働に戻されたら作業を再開します"
+            } else {
+                "ウェブアプリの設定で稼働に戻されました。作業を再開します"
+            })?;
+        }
+        if paused {
+            self.title(&format!("{TITLE_PREFIX} - 停止中"))?;
+        }
+        Ok(paused)
     }
 
     /// ロードマップの並びの先頭の作業計画書を始め、計画書名と状態を返す。
@@ -665,9 +722,30 @@ impl Director<'_, '_> {
         if matches!(next, Next::Wait(_) | Next::Finished) {
             return Ok(Pace::Continue);
         }
+        let Some(slot) = next.slot() else {
+            return Ok(Pace::Continue);
+        };
+        // 担当ごとのエージェントは、この回の稼働の設定と同じ読み取りで読んだ値を使う。ウェブアプリを設定していなければ既定にする。
+        let slot = instruction::protocol_slot(slot);
+        let setting = self
+            .operation
+            .as_ref()
+            .map_or_else(|| slot.default_setting(), |operation| operation.agent(slot));
+        let now = self.start.clock.now();
         // 指示と記録のディレクトリを用意できてから開始の印を保存し、起動しなかったセッションを中断として伝えない。
-        flow::begin_session(&mut state)?;
-        let Some(launch) = Launch::new(&dir, &state, &next, self.start.clock.now())? else {
+        flow::begin_session(
+            &mut state,
+            SessionAgent {
+                agent: setting.agent.value().to_owned(),
+                model: setting
+                    .model
+                    .as_ref()
+                    .map(|model| model.as_str().to_owned()),
+                effort: setting.effort.map(|effort| effort.value().to_owned()),
+            },
+            now,
+        )?;
+        let Some(launch) = Launch::new(&dir, &state, &next, now, &setting)? else {
             return Ok(Pace::Continue);
         };
         lock.save(&state)?;
@@ -715,7 +793,7 @@ impl Director<'_, '_> {
     /// 現在の状態を送信スレッドへ渡す。送信や報告用のロードマップの取得は待たない。
     fn report(&mut self, running: bool) {
         if let Some(reporting) = &mut self.reporting {
-            reporting.update(running, self.start.clock.now());
+            reporting.update(running, self.paused, self.start.clock.now());
         }
     }
 

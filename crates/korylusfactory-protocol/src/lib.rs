@@ -1,6 +1,7 @@
 //! ディレクター (`korylusfactory start`) とウェブアプリがやり取りする型。
 //!
 //! ディレクターは [`StatusReport`] をJSONにして `PUT /api/v1/director/status` で送り、ウェブアプリはそれを受け取って表示する。
+//! また、人間がウェブアプリで決めた [`Settings`] を `GET /api/v1/director/settings` で読む。
 //! ディレクターとウェブアプリは別々に入れ直すため、版がずれても読めるよう、次を守る。
 //!
 //! - 送る側も受ける側も、知らない項目を無視する (`deny_unknown_fields` を付けない)
@@ -8,7 +9,15 @@
 //! - 一覧は空でも `[]` で送る。受け取るときは、キーの省略を空の一覧として扱う
 //! - 項目を足すときは、無くても読めるよう `Option` か `#[serde(default)]` にする
 
+mod agents;
+
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+pub use agents::{
+    Agent, AgentEntry, AgentEntryResult, AgentSetting, Effort, InvalidAgentSetting, Model, Slot,
+};
 
 /// ディレクターが送る、プロジェクトの状態の報告。
 ///
@@ -21,6 +30,12 @@ pub struct StatusReport {
     pub korylusfactory: Version,
     /// 作業者かレビュアーのセッションを実行しているかどうか。
     pub running: bool,
+    /// ウェブアプリの設定で停止したことを反映し、次の作業を始めずに待っているかどうか。
+    ///
+    /// 停止に切り替えられても、セッションを実行している間は設定をまだ読んでいないため偽になる。
+    /// この項目の無い版のディレクターの報告は、偽として読む。
+    #[serde(default)]
+    pub paused: bool,
     /// 進め始めて、まだ完了を記録していない作業計画書。
     #[serde(default)]
     pub progress: Vec<PlanProgress>,
@@ -59,6 +74,60 @@ pub struct PlanProgress {
     /// 作業計画書のタスクの一覧。計画書に書いた順に並べる。
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// この作業計画書で直近に起動したセッション。新しい順に並べ、実行中のものを含む。
+    ///
+    /// ディレクターは直近の5件を送る。この項目の無い版のディレクターの報告は、空として読む。
+    #[serde(default)]
+    pub sessions: Vec<Session>,
+}
+
+/// ディレクターが起動したセッション1つ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    /// タスクの番号 (例: `1-2`)。作業報告書のセッションでは無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// セッションで進めたステップ。
+    pub step: Step,
+    /// レビューの回数 (1始まり)。レビューと、その指摘の修正のときだけ持つ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<u32>,
+    /// セッションを動かした担当。
+    pub role: Role,
+    /// 使ったエージェント ([`Agent::value`] の値)。
+    pub agent: String,
+    /// 指定したモデル。指定しなかったときは無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 指定したeffort ([`Effort::value`] の値)。指定しなかったときは無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// 起動した時刻 (RFC 3339のUTC)。
+    pub started_at: String,
+    /// 終わった時刻 (RFC 3339のUTC)。実行中なら無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// 終わったときの結果。実行中なら無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Outcome>,
+}
+
+/// セッションを動かした担当。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Role {
+    /// 担当の種類 (例: `implementer`)。
+    pub kind: String,
+    /// 画面に出す表示名 (例: `作業者`)。
+    pub label: String,
+}
+
+/// セッションが終わったときの結果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    /// 結果の種類 (CLIの状態ファイルと同じ値。例: `recorded`)。
+    pub kind: String,
+    /// 画面に出す表示名 (例: `Request Changes`・`質問を返した`)。
+    pub label: String,
 }
 
 /// 進めているステップ。
@@ -117,6 +186,22 @@ pub struct UpcomingPlan {
     pub url: Option<String>,
 }
 
+/// 人間がウェブアプリで決めた、プロジェクトの設定。ディレクターが読む。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Settings {
+    /// 停止していれば真。ディレクターは、実行中のセッションが終わったところで次の作業を始めずに待つ。
+    /// この項目の無い応答は、稼働として読む。
+    #[serde(default)]
+    pub paused: bool,
+    /// 担当ごとのエージェントの設定。キーは枠 ([`Slot::value`] の値) で、人間が保存した枠だけを載せる。
+    ///
+    /// 載っていない枠は既定 ([`Slot::default_setting`]) として扱い、知らない枠は無視する。
+    /// 形式の誤りも枠ごとに保持する。使う前に [`AgentEntryResult::validate`] を通す。
+    /// この項目の無い応答は、すべての枠を既定として読む。
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentEntryResult>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -131,6 +216,7 @@ mod tests {
                 commit: "abc1234".to_owned(),
             },
             running: true,
+            paused: false,
             progress: vec![PlanProgress {
                 name: "webapp-status".to_owned(),
                 title: "ウェブアプリの骨格と状態の表示 作業計画書".to_owned(),
@@ -146,6 +232,47 @@ mod tests {
                     title: "ウェブアプリのクレートを作る".to_owned(),
                     status: TaskStatus::InProgress,
                 }],
+                sessions: vec![
+                    Session {
+                        task: Some("1-2".to_owned()),
+                        step: Step {
+                            kind: "review".to_owned(),
+                            label: "レビュー".to_owned(),
+                        },
+                        review: Some(2),
+                        role: Role {
+                            kind: "reviewer".to_owned(),
+                            label: "レビュアー".to_owned(),
+                        },
+                        agent: "claude".to_owned(),
+                        model: Some("claude-opus-5-5".to_owned()),
+                        effort: Some("high".to_owned()),
+                        started_at: "2026-11-19T07:50:00Z".to_owned(),
+                        ended_at: None,
+                        result: None,
+                    },
+                    Session {
+                        task: Some("1-2".to_owned()),
+                        step: Step {
+                            kind: "implement".to_owned(),
+                            label: "実装".to_owned(),
+                        },
+                        review: None,
+                        role: Role {
+                            kind: "implementer".to_owned(),
+                            label: "作業者".to_owned(),
+                        },
+                        agent: "codex".to_owned(),
+                        model: None,
+                        effort: None,
+                        started_at: "2026-11-19T07:20:00Z".to_owned(),
+                        ended_at: Some("2026-11-19T07:48:00Z".to_owned()),
+                        result: Some(Outcome {
+                            kind: "recorded".to_owned(),
+                            label: "記録した".to_owned(),
+                        }),
+                    },
+                ],
             }],
             upcoming: vec![UpcomingPlan {
                 title: "メッセージ 作業計画書".to_owned(),
@@ -156,12 +283,22 @@ mod tests {
 
     #[test]
     fn 報告をjsonにして読み戻すと同じ値になる() {
-        let report = report();
+        let paused_report = StatusReport {
+            running: false,
+            paused: true,
+            ..report()
+        };
+        for report in [report(), paused_report] {
+            let value = serde_json::to_value(&report).expect("JSONにできなかった");
+            assert_eq!(
+                value["paused"],
+                json!(report.paused),
+                "停止のJSONの形が違う"
+            );
 
-        let text = serde_json::to_string(&report).expect("JSONにできなかった");
-        let back: StatusReport = serde_json::from_str(&text).expect("JSONを読めなかった");
-
-        assert_eq!(back, report, "読み戻した報告が元と違う");
+            let back: StatusReport = serde_json::from_value(value).expect("JSONを読めなかった");
+            assert_eq!(back, report, "読み戻した報告が元と違う");
+        }
     }
 
     #[test]
@@ -183,6 +320,22 @@ mod tests {
             json!("in_progress"),
             "進み具合の値の形が違う"
         );
+        let running = &value["progress"][0]["sessions"][0];
+        for key in ["ended_at", "result"] {
+            assert_eq!(
+                running.get(key),
+                None,
+                "実行中のセッションの {key} のキーを省かなかった"
+            );
+        }
+        let implementer = &value["progress"][0]["sessions"][1];
+        for key in ["review", "model", "effort"] {
+            assert_eq!(
+                implementer.get(key),
+                None,
+                "指定しなかったセッションの {key} のキーを省かなかった"
+            );
+        }
     }
 
     #[test]
@@ -221,8 +374,148 @@ mod tests {
             "省いたタスクの一覧を空にしなかった"
         );
         assert!(
+            got.progress[0].sessions.is_empty(),
+            "省いたセッションの一覧を空にしなかった"
+        );
+        assert!(
             got.upcoming.is_empty(),
             "省いたこれから進める作業計画書を空にしなかった"
         );
+        assert!(!got.paused, "省いた停止を偽として読まなかった");
+    }
+
+    #[test]
+    fn 設定は停止をjsonの真偽値で読み書きし_省いた停止は稼働として読む() {
+        let value = serde_json::to_value(Settings {
+            paused: true,
+            ..Settings::default()
+        })
+        .expect("JSONにできなかった");
+        assert_eq!(
+            value,
+            json!({"paused": true, "agents": {}}),
+            "設定のJSONの形が違う"
+        );
+        let paused: Settings = serde_json::from_value(value).expect("停止の設定を読めなかった");
+        assert!(paused.paused, "停止を真として読まなかった");
+
+        let empty: Settings =
+            serde_json::from_value(json!({"future": 1})).expect("停止の無い設定を読めなかった");
+        assert_eq!(
+            empty,
+            Settings::default(),
+            "省いた停止を稼働として読まなかった"
+        );
+    }
+
+    #[test]
+    fn 担当ごとのエージェントは保存した枠だけを載せ_指定しないモデルとeffortはキーを省く() {
+        let settings = Settings {
+            paused: false,
+            agents: BTreeMap::from([
+                (
+                    Slot::Implementer.value().to_owned(),
+                    AgentEntryResult::Decoded(
+                        AgentSetting {
+                            agent: Agent::Claude,
+                            model: Some(
+                                Model::parse("claude-opus-5-5").expect("モデルを読めなかった"),
+                            ),
+                            effort: Some(Effort::High),
+                        }
+                        .to_entry(),
+                    ),
+                ),
+                (
+                    Slot::ReviewerOdd.value().to_owned(),
+                    AgentEntryResult::Decoded(Slot::ReviewerOdd.default_setting().to_entry()),
+                ),
+            ]),
+        };
+
+        let value = serde_json::to_value(&settings).expect("JSONにできなかった");
+
+        assert_eq!(
+            value,
+            json!({
+                "paused": false,
+                "agents": {
+                    "implementer": {"agent": "claude", "model": "claude-opus-5-5", "effort": "high"},
+                    "reviewer_odd": {"agent": "codex"}
+                }
+            }),
+            "担当ごとのエージェントのJSONの形が違う"
+        );
+        let back: Settings = serde_json::from_value(value).expect("JSONを読めなかった");
+        assert_eq!(back, settings, "読み戻した設定が元と違う");
+    }
+
+    #[test]
+    fn 担当ごとのエージェントの無い設定は空として読み_知らない枠と値は検証の前まで読む() {
+        let missing: Settings = serde_json::from_value(json!({"paused": true}))
+            .expect("agentsの無い設定を読めなかった");
+        assert!(
+            missing.agents.is_empty(),
+            "省いたagentsを空として読まなかった"
+        );
+
+        let got: Settings = serde_json::from_value(json!({
+            "agents": {
+                "watcher": {"agent": "claude", "future": 1},
+                "reviewer_even": {"agent": "gemini", "model": null, "effort": "minimal"}
+            }
+        }))
+        .expect("知らない枠と値のある設定を読めなかった");
+
+        assert_eq!(
+            got.agents.keys().collect::<Vec<_>>(),
+            ["reviewer_even", "watcher"],
+            "知らない枠と値のある枠を読まなかった"
+        );
+        let even = &got.agents["reviewer_even"];
+        assert_eq!(
+            *even,
+            AgentEntryResult::Decoded(AgentEntry {
+                agent: "gemini".to_owned(),
+                model: None,
+                effort: Some("minimal".to_owned()),
+            }),
+            "nullのモデルを指定しないものとして読まなかった"
+        );
+        assert_eq!(
+            even.validate(),
+            Err(InvalidAgentSetting::Agent),
+            "知らないエージェントが検証を通った"
+        );
+    }
+
+    #[test]
+    fn 形式の違う枠があっても停止と正常な枠を読み_誤った枠は検証で拒む() {
+        let got: Settings = serde_json::from_str(
+            r#"{
+                "paused": true,
+                "agents": {
+                    "watcher": {},
+                    "implementer": {"agent": "claude"},
+                    "reviewer_odd": {"agent": "codex", "effort": 42},
+                    "reviewer_even": ["claude", null, null]
+                }
+            }"#,
+        )
+        .expect("枠の形式が違うと設定全体を読めなかった");
+
+        assert!(got.paused, "停止を真として読まなかった");
+        assert_eq!(
+            got.agents["implementer"].validate(),
+            Ok(Slot::Implementer.default_setting()),
+            "正常な枠を読めなかった"
+        );
+        for slot in ["reviewer_odd", "reviewer_even"] {
+            assert_eq!(
+                got.agents[slot].validate(),
+                Err(InvalidAgentSetting::Format),
+                "{slot} の形式の誤りを検出しなかった"
+            );
+        }
     }
 }

@@ -155,7 +155,7 @@ mod tests {
         DEFAULT_REVIEW_LIMIT, finish_fix, finish_report_fix, finish_review, next, resume,
     };
     use super::*;
-    use crate::state::Reviewer;
+    use crate::state::{Reviewer, Slot};
 
     /// 作業報告書のURL。
     const URL: &str = "https://wikino.app/s/shimbaco/pages/2940";
@@ -276,7 +276,7 @@ mod tests {
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::ReportReview {
                 url: URL.to_owned(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 number: 1,
                 prefix: "demo-report".to_owned(),
             }
@@ -346,12 +346,13 @@ mod tests {
         finish_report(&mut state, &plan, &project, reported(None), now())
             .expect("作業報告書の記録を受け付けなかった");
         let path = write_review(&project, 1, "Comment", AUTO_FIX);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::ReportFix {
                 url: URL.to_owned(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 doc: path,
             }
         );
@@ -385,7 +386,8 @@ mod tests {
         )
         .expect("作業報告書の記録を受け付けなかった");
         write_review(&project, 1, "Approve", "");
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             wait_kind(&state),
             Some(WaitKind::Report),
@@ -407,7 +409,8 @@ mod tests {
         finish_report(&mut state, &plan, &project, reported(None), now())
             .expect("作業報告書の記録を受け付けなかった");
         let path = write_review(&project, 1, "Comment", NEEDS_HUMAN);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             wait_kind(&state),
             Some(WaitKind::Review),
@@ -424,7 +427,7 @@ mod tests {
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::ReportFix {
                 url: URL.to_owned(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 doc: path,
             },
             "再開したあとに作業報告書の修正へ進まなかった"
@@ -450,11 +453,12 @@ mod tests {
         let mut last = PathBuf::new();
         for number in 1..=DEFAULT_REVIEW_LIMIT {
             match next(&mut state, &plan).expect("次に行うことを決められなかった") {
-                Next::ReportReview { reviewer, .. } => reviewers.push(reviewer),
+                Next::ReportReview { slot, .. } => reviewers.push(slot),
                 other => panic!("{number}回目のレビューに進まなかった: {other:?}"),
             }
             last = write_review(&project, number, "Request Changes", AUTO_FIX);
-            finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+            finish_review(&mut state, &project, now(), Reviewer::Codex)
+                .expect("レビューの完了を受け付けなかった");
             if number < DEFAULT_REVIEW_LIMIT {
                 finish_report_fix(&mut state, &project)
                     .expect("作業報告書の修正の完了を受け付けなかった");
@@ -462,8 +466,8 @@ mod tests {
         }
         assert_eq!(
             reviewers,
-            [Reviewer::Codex, Reviewer::Claude, Reviewer::Codex],
-            "レビュアーを交互に替えていない"
+            [Slot::ReviewerOdd, Slot::ReviewerEven, Slot::ReviewerOdd],
+            "レビュアーの枠を交互に替えていない"
         );
         let wait = state.wait.clone().expect("人間を待っていない");
         assert_eq!(wait.kind, WaitKind::ReviewLimit, "人間を待つ場面が違う");
@@ -477,7 +481,7 @@ mod tests {
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::ReportFix {
                 url: URL.to_owned(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 doc: last,
             },
             "再開したあとに作業報告書の修正へ進まなかった"

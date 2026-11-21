@@ -2,28 +2,31 @@
 
 use std::collections::HashSet;
 
-use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use jiff::Timestamp;
 use jiff::civil::DateTime;
-use korylusfactory_protocol::StatusReport;
+use korylusfactory_protocol::{AgentEntryResult, Settings, StatusReport};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::IgnoredAny;
 
 use crate::app::AppState;
 use crate::auth::Principal;
-use crate::db;
+use crate::{agents, db, settings};
 
 /// APIのパスの接頭辞。この下の応答は、エラーもProblem Detailsで返す。
 pub const PREFIX: &str = "/api/";
 
 /// 状態の報告を受け取るパス。
 pub const STATUS_PATH: &str = "/api/v1/director/status";
+
+/// ディレクターが稼働と担当ごとのエージェントの設定を読むパス。
+pub const SETTINGS_PATH: &str = "/api/v1/director/settings";
 
 /// APIの応答に付けるヘッダー。
 pub const HEADERS: [(HeaderName, &str); 3] = [
@@ -277,6 +280,44 @@ pub async fn put_status(
     }
 }
 
+/// `GET /api/v1/director/settings`: ディレクターのプロジェクトの設定を返す。
+///
+/// 稼働の設定を保存していなければ稼働として返す。
+/// 担当ごとのエージェントは保存した既知の枠だけを載せ、載せない枠はディレクターが既定として扱う。
+/// プロジェクトは、状態の報告と同じく設定でディレクターのVM名に対応付けたものを使う。
+pub async fn get_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    let Principal::Director { project, .. } = principal else {
+        return Problem::forbidden().into_response();
+    };
+    let loaded = async {
+        let operation = settings::load(&state.database, &project).await?;
+        let agents = agents::load(&state.database, &project).await?;
+        Ok::<_, db::Error>((operation, agents))
+    };
+    match loaded.await {
+        Ok((operation, agents)) => {
+            let body = Settings {
+                paused: operation.is_paused(),
+                agents: agents
+                    .into_iter()
+                    .map(|(slot, entry)| {
+                        (slot.value().to_owned(), AgentEntryResult::Decoded(entry))
+                    })
+                    .collect(),
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(error) => {
+            // 原因のSQLiteのエラー文には保存した値が入ることがあるため、原因をたどらずに記録する。
+            log::error!("ディレクターに返す設定を読めません: {error}");
+            Problem::internal_error().into_response()
+        }
+    }
+}
+
 /// 報告を保存する。同じ本文の再送と、保存済みの報告より前に受け取った報告は書き込まない。
 ///
 /// 新旧は、このVMの時計で採った受信時刻で決める。
@@ -437,6 +478,25 @@ fn validate(report: &StatusReport) -> Vec<FieldError> {
         if plan.url.trim().is_empty() {
             error(format!("/progress/{index}/url"), "URLが空です。");
         }
+        for (session_index, session) in plan.sessions.iter().enumerate() {
+            let pointer = format!("/progress/{index}/sessions/{session_index}");
+            if !is_utc_timestamp(&session.started_at) {
+                error(
+                    format!("{pointer}/started_at"),
+                    "UTCのRFC 3339の時刻 (例: 2026-11-19T08:00:00Z) にしてください。",
+                );
+            }
+            if session
+                .ended_at
+                .as_deref()
+                .is_some_and(|ended_at| !is_utc_timestamp(ended_at))
+            {
+                error(
+                    format!("{pointer}/ended_at"),
+                    "UTCのRFC 3339の時刻 (例: 2026-11-19T08:00:00Z) にしてください。",
+                );
+            }
+        }
         for (task_index, task) in plan.tasks.iter().enumerate() {
             if task.number.trim().is_empty() {
                 error(
@@ -498,6 +558,21 @@ mod tests {
             .expect("progressが配列ではない")
             .push(second);
 
+        value["progress"][0]["sessions"] = json!([
+            {
+                "step": {"kind": "report", "label": "作業報告書の作成"},
+                "role": {"kind": "implementer", "label": "作業者"},
+                "agent": "claude",
+                "started_at": "2026-11-19T08:00:00Z"
+            },
+            {
+                "step": {"kind": "report", "label": "作業報告書の作成"},
+                "role": {"kind": "implementer", "label": "作業者"},
+                "agent": "claude",
+                "started_at": "2026-11-19 08:00",
+                "ended_at": "あとで"
+            }
+        ]);
         let pointers: Vec<String> = validate(&parsed(&value))
             .into_iter()
             .map(|error| error.pointer)
@@ -508,6 +583,8 @@ mod tests {
             [
                 "/sent_at",
                 "/progress/0/url",
+                "/progress/0/sessions/1/started_at",
+                "/progress/0/sessions/1/ended_at",
                 "/progress/0/tasks/0/number",
                 "/progress/1/name"
             ],

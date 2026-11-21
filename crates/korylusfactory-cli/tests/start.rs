@@ -5,13 +5,15 @@ use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use korylusfactory_core::state::{Step, Store};
+use korylusfactory_core::state::{SessionResult, Step, Store};
 use korylusfactory_protocol::StatusReport;
+use rustix::process::Signal;
 
 /// 偽物のwikinoとClaude Codeを `PATH` の先頭に置いた、作業計画書を1つ進めるプロジェクト。
 struct Project {
@@ -223,6 +225,54 @@ impl Drop for Running {
     }
 }
 
+#[test]
+fn ウェブ報告を設定せずにctrl_cで止めても取り消しを保存する() {
+    cancel_without_web(Signal::INT);
+}
+
+#[test]
+fn ウェブ報告を設定せずにsigtermで止めても取り消しを保存する() {
+    cancel_without_web(Signal::TERM);
+}
+
+/// ウェブ報告を設定しないプロジェクトで、セッションの実行中に `signal` を送って止め、取り消しが保存されることを確かめる。
+fn cancel_without_web(signal: Signal) {
+    let project = project();
+    let mut running = Running(
+        start(&project)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("korylusfactory start を起動できなかった"),
+    );
+    until("セッションが起動しなかった", || {
+        fs::read_to_string(&project.pid).is_ok_and(|pid| pid.ends_with('\n'))
+    });
+    let pid = running.0.id();
+
+    rustix::process::kill_process(rustix::process::Pid::from_child(&running.0), signal)
+        .expect("シグナルを送れなかった");
+
+    until("シグナルで終了しなかった", || !alive(pid));
+    assert!(
+        running.0.wait().expect("終了を待てなかった").success(),
+        "シグナルで正常に終了しなかった"
+    );
+    let state = Store::new(&project.root)
+        .plan("demo")
+        .expect("状態の置き場を決められなかった")
+        .load()
+        .expect("状態を読めなかった")
+        .expect("状態が無い");
+    let session = state.sessions.last().expect("セッションの記録が無い");
+    assert_eq!(
+        session.result,
+        Some(SessionResult::Cancelled),
+        "取り消しを記録していない"
+    );
+    assert!(session.ended_at.is_some(), "終了時刻を記録していない");
+    assert!(state.session_started, "開始の印を外した");
+}
+
 /// 準備完了のディレクトリの名前から、偽物のセッションのPIDを読む。
 fn agents(base: &Path) -> Vec<u32> {
     fs::read_dir(base)
@@ -417,7 +467,38 @@ fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Optio
 }
 
 /// 報告と接続を返す。テストから任意の時点で204を返せるようにする。
+///
+/// 稼働の設定の読み取りには、稼働を返して次の要求を待つ。
 fn receive_report(listener: &TcpListener, timeout: Duration) -> (StatusReport, TcpStream) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (request_line, body, mut stream) = receive_request(listener, remaining);
+        if request_line.starts_with("GET ") {
+            assert!(
+                request_line.starts_with("GET /api/v1/director/settings "),
+                "想定しない読み取り: {request_line}"
+            );
+            let settings = br#"{"paused": false}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        settings.len()
+                    )
+                    .as_bytes(),
+                )
+                .and_then(|()| stream.write_all(settings))
+                .expect("設定を返せなかった");
+            continue;
+        }
+        let report = serde_json::from_slice(&body).expect("本文が状態の報告ではない");
+        return (report, stream);
+    }
+}
+
+/// 要求を1つ受け取り、要求行と本文と接続を返す。
+fn receive_request(listener: &TcpListener, timeout: Duration) -> (String, Vec<u8>, TcpStream) {
     let stream = wait_for(timeout, || match listener.accept() {
         Ok((stream, _)) => Some(stream),
         Err(err) if err.kind() == ErrorKind::WouldBlock => None,
@@ -435,6 +516,10 @@ fn receive_report(listener: &TcpListener, timeout: Duration) -> (StatusReport, T
         .expect("書き込みの上限を設定できなかった");
 
     let mut reader = BufReader::new(&stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("要求行を読めなかった");
     let mut length = 0;
     loop {
         let mut line = String::new();
@@ -455,8 +540,8 @@ fn receive_report(listener: &TcpListener, timeout: Duration) -> (StatusReport, T
     reader
         .read_exact(&mut body)
         .expect("要求の本文を読めなかった");
-    let report = serde_json::from_slice(&body).expect("本文が状態の報告ではない");
-    (report, stream)
+    drop(reader);
+    (request_line.trim_end().to_owned(), body, stream)
 }
 
 fn acknowledge(mut stream: TcpStream) {
@@ -467,6 +552,43 @@ fn acknowledge(mut stream: TcpStream) {
 
 #[test]
 fn ウェブアプリに報告するときは_ctrl_cで最後の状態を送ってから止まる() {
+    cancel_with_web(Signal::INT, acknowledge_final_report);
+}
+
+#[test]
+fn ウェブアプリに報告するときは_sigtermで最後の状態を送ってから止まる() {
+    cancel_with_web(Signal::TERM, acknowledge_final_report);
+}
+
+#[test]
+fn 最後の報告を待つ間は_どちらのシグナルでも2回目で終了する() {
+    for first in [Signal::INT, Signal::TERM] {
+        for second in [Signal::INT, Signal::TERM] {
+            cancel_with_web(first, |child, stream, _log| {
+                rustix::process::kill_process(rustix::process::Pid::from_child(child), second)
+                    .unwrap_or_else(|err| {
+                        panic!("{first:?} のあとに {second:?} を送れなかった: {err}")
+                    });
+                let status = wait_for(Duration::from_secs(5), || {
+                    child.try_wait().expect("終了状態を読めなかった")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{first:?} のあとに {second:?} を送っても終了しなかった")
+                });
+                assert_eq!(
+                    status.signal(),
+                    Some(second.as_raw()),
+                    "{first:?} のあとに {second:?} を送ったときの終了状態が異なる: {status}"
+                );
+                // HTTP応答を保留したまま終了したことを確かめてから接続を閉じる。
+                drop(stream);
+            });
+        }
+    }
+}
+
+/// セッションの実行中に `signal` を送り、最後の状態の報告を受け取ってから `finish` で終了を確かめる。
+fn cancel_with_web(signal: Signal, finish: impl FnOnce(&mut Child, TcpStream, &Path)) {
     let project = project();
     let listener = TcpListener::bind("127.0.0.1:0").expect("待ち受けを始められなかった");
     listener
@@ -510,11 +632,8 @@ fn ウェブアプリに報告するときは_ctrl_cで最後の状態を送っ�
         .parse()
         .expect("セッションのPIDを読み取れなかった");
 
-    rustix::process::kill_process(
-        rustix::process::Pid::from_child(&running.0),
-        rustix::process::Signal::INT,
-    )
-    .expect("Ctrl+Cを送れなかった");
+    rustix::process::kill_process(rustix::process::Pid::from_child(&running.0), signal)
+        .expect("シグナルを送れなかった");
     let (last, stream) = receive_report(&listener, timeout);
     assert!(!last.running, "最後の報告がセッションの実行中のままだった");
     assert_eq!(
@@ -522,9 +641,18 @@ fn ウェブアプリに報告するときは_ctrl_cで最後の状態を送っ�
         Some("demo"),
         "最後の報告に進めている作業計画書が無い"
     );
+
+    finish(&mut running.0, stream, &log);
+    until(
+        "止めたあとも、セッションが動き続けている",
+        || !alive(session),
+    );
+}
+
+/// 最後の報告に応答するまで実行を続け、応答後に正常終了することを確かめる。
+fn acknowledge_final_report(child: &mut Child, stream: TcpStream, log: &Path) {
     let mut exit_status = || {
-        running
-            .0
+        child
             .try_wait()
             .expect("korylusfactory start の終了状態を読めなかった")
     };
@@ -537,11 +665,7 @@ fn ウェブアプリに報告するときは_ctrl_cで最後の状態を送っ�
         .expect("最終報告に応答しても korylusfactory start が終了しなかった");
     assert!(
         status.success(),
-        "Ctrl+Cで取り消して終わらなかった: {status}\n{}",
-        fs::read_to_string(&log).unwrap_or_default()
-    );
-    until(
-        "止めたあとも、セッションが動き続けている",
-        || !alive(session),
+        "シグナルで取り消して終わらなかった: {status}\n{}",
+        fs::read_to_string(log).unwrap_or_default()
     );
 }

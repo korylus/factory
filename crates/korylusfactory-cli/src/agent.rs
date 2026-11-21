@@ -16,6 +16,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -44,6 +45,22 @@ const CLAUDE_DENIED: [&str; 5] = [
 
 /// pushの宛先を書き換える先の、存在しないリモートヘルパーの名前。
 const PUSH_DISABLED: &str = "korylusfactory-push-disabled";
+
+/// CLIが、指定したモデルかeffortを拒んだことを示す文字列。
+///
+/// 各CLIに誤った値を渡して確かめたもの (Claude Code 2.1.328・codex-cli 0.170.0)。
+/// Claude Codeは、知らないeffortを警告して既定で動くため、effortの文字列は持たない。
+mod rejected {
+    /// Claude Codeが、知らないモデルを渡されたときに標準エラーへ書く。
+    pub(super) const CLAUDE_MODEL: &str = "[claude-code:unrecognized_model]";
+    /// Codexが、使えないモデルを渡されたときに `--json` の出力へ書く。
+    pub(super) const CODEX_MODEL: &str = "model is not supported";
+    /// Codexが、知らないeffortを渡されたときに `--json` の出力へ書く。
+    pub(super) const CODEX_EFFORT: &str = "[reasoning.effort] [invalid_enum_value]";
+}
+
+/// 値を拒んだ文面として残す長さの上限 (文字数)。人間待ちの理由に載せるため、長い出力の行を切り詰める。
+const REJECTED_TEXT_LIMIT: usize = 500;
 
 /// セッションの記録を残すファイルの名前。
 const PROMPT_FILE: &str = "prompt.md";
@@ -84,6 +101,10 @@ pub enum Outcome {
     NeedsHuman(String),
     /// 結果を返さずに終わったか、時間の上限を過ぎた。同じステップをやり直す。
     Stopped(String),
+    /// 指定したモデルかeffortをCLIが受け付けずに終わった。CLIが値を拒んだ文面を持つ。
+    ///
+    /// 同じ設定でやり直しても同じ失敗を繰り返すため、やり直さずに人間待ちにする。
+    Rejected(String),
     /// 取り消された。
     Cancelled,
 }
@@ -121,6 +142,14 @@ struct ClaudeOutput {
     structured_output: Option<serde_json::Value>,
 }
 
+/// Codexの `--json` の出力のうち、設定の拒否を見分けるために読むエラーイベント。
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexDiagnostic {
+    /// CLIが報告したエラーと、その文面。
+    Error { message: String },
+}
+
 /// プロジェクトのルートrootで、頼むことrequestのセッションを起動し、結果を受け取る。
 ///
 /// 指示・結果の形・標準出力・標準エラーは、ディレクトリlogsに残す。
@@ -156,8 +185,22 @@ pub fn run(
         exclusive: None,
     };
     let reason = match launcher.launch(&session, cancel)? {
-        Ended::Exited(0) => return Ok(read_result(request.agent, logs)),
-        Ended::Exited(code) => format!("セッションが終了コード {code} で終わりました"),
+        Ended::Exited(0) => {
+            let outcome = read_result(request.agent, logs);
+            // Claude Codeは、APIのエラーでも終了コード0で is_error を返すことがある。
+            if matches!(outcome, Outcome::Stopped(_))
+                && let Some(text) = rejection(request, logs)
+            {
+                return Ok(Outcome::Rejected(text));
+            }
+            return Ok(outcome);
+        }
+        Ended::Exited(code) => {
+            if let Some(text) = rejection(request, logs) {
+                return Ok(Outcome::Rejected(text));
+            }
+            format!("セッションが終了コード {code} で終わりました")
+        }
         Ended::Signaled => "セッションがシグナルで終わりました".to_owned(),
         Ended::TimedOut => format!(
             "セッションが時間の上限 ({}分) を過ぎても終わりませんでした",
@@ -180,6 +223,8 @@ fn program(agent: Agent) -> &'static str {
 }
 
 /// 頼むことrequestのセッションの引数を返す。指示は標準入力で渡す。
+///
+/// モデルとeffortは、検証を通した値をそれぞれ1つの引数として渡し、シェルを通さない。
 fn args(request: &Request, logs: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     match request.agent {
@@ -198,6 +243,12 @@ fn args(request: &Request, logs: &Path) -> Vec<OsString> {
                 .map(OsString::from),
             );
             args.extend(CLAUDE_DENIED.map(OsString::from));
+            if let Some(model) = &request.model {
+                args.extend(["--model", model.as_str()].map(OsString::from));
+            }
+            if let Some(effort) = request.effort {
+                args.extend(["--effort", effort.value()].map(OsString::from));
+            }
         }
         Agent::Codex => {
             args.extend(
@@ -214,6 +265,14 @@ fn args(request: &Request, logs: &Path) -> Vec<OsString> {
             args.push(logs.join(SCHEMA_FILE).into());
             args.push("-o".into());
             args.push(logs.join(RESULT_FILE).into());
+            if let Some(model) = &request.model {
+                args.extend(["-m", model.as_str()].map(OsString::from));
+            }
+            if let Some(effort) = request.effort {
+                // 設定の上書きのうち、渡すのはeffortだけにし、ほかの値を設定から受け取らない。
+                args.push("-c".into());
+                args.push(format!("model_reasoning_effort={}", effort.value()).into());
+            }
             args.push("-".into());
         }
     }
@@ -259,6 +318,46 @@ fn read_result(agent: Agent, logs: &Path) -> Outcome {
     }
 }
 
+/// 失敗したセッションのログlogsから、requestで指定したモデルかeffortをCLIが拒んだことを見分ける。
+///
+/// Claude Codeは標準エラーの診断、Codexは標準出力のエラーイベントを調べる。
+fn rejection(request: &Request, logs: &Path) -> Option<String> {
+    match request.agent {
+        Agent::Claude if request.model.is_some() => {
+            find_rejection(&logs.join(STDERR_FILE), |line| {
+                line.starts_with(rejected::CLAUDE_MODEL)
+            })
+        }
+        Agent::Codex if request.model.is_some() || request.effort.is_some() => {
+            find_rejection(&logs.join(STDOUT_FILE), |line| {
+                let Ok(CodexDiagnostic::Error { message }) = serde_json::from_str(line) else {
+                    return false;
+                };
+                (request.model.is_some() && message.contains(rejected::CODEX_MODEL))
+                    || (request.effort.is_some() && message.contains(rejected::CODEX_EFFORT))
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 記録pathを1行ずつ読み、is_rejectionに合う診断を最初に見つけた行から返す。
+///
+/// 読めない記録は、拒否を見分けられなかったものとして再試行に回す。
+fn find_rejection(path: &Path, is_rejection: impl Fn(&str) -> bool) -> Option<String> {
+    let mut file = io::BufReader::new(fs::File::open(path).ok()?);
+    let mut bytes = Vec::new();
+    while file.read_until(b'\n', &mut bytes).ok()? != 0 {
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim();
+        if is_rejection(line) {
+            return Some(line.chars().take(REJECTED_TEXT_LIMIT).collect());
+        }
+        bytes.clear();
+    }
+    None
+}
+
 /// Claude Codeの出力から、結果のJSONを読む。
 fn read_claude(logs: &Path) -> Result<Raw, String> {
     let src = read(&logs.join(STDOUT_FILE))?;
@@ -292,23 +391,31 @@ mod tests {
     use crate::branch::testutil::{git_run, repo_on, temp_dir};
 
     /// 決めた出力をファイルに書き、決めた終わり方を返すLauncher。起動したセッションを記録する。
-    struct Fake {
+    struct Fake<'a> {
         /// 標準出力に書く内容。
-        stdout: &'static str,
+        stdout: &'a str,
         /// Codexの結果のファイルに書く内容。
-        result: Option<&'static str>,
+        result: Option<&'a str>,
+        /// 標準エラーに書く内容。
+        stderr: &'a str,
         ended: Ended,
         launched: RefCell<Option<Session>>,
     }
 
-    impl Fake {
-        fn new(stdout: &'static str, result: Option<&'static str>, ended: Ended) -> Self {
+    impl<'a> Fake<'a> {
+        fn new(stdout: &'a str, result: Option<&'a str>, ended: Ended) -> Self {
             Self {
                 stdout,
                 result,
+                stderr: "",
                 ended,
                 launched: RefCell::new(None),
             }
+        }
+
+        fn with_stderr(mut self, stderr: &'a str) -> Self {
+            self.stderr = stderr;
+            self
         }
 
         fn session(&self) -> Session {
@@ -319,9 +426,10 @@ mod tests {
         }
     }
 
-    impl Launcher for Fake {
+    impl Launcher for Fake<'_> {
         fn launch(&self, session: &Session, _cancel: &AtomicBool) -> Result<Ended, process::Error> {
             fs::write(&session.stdout, self.stdout).expect("標準出力を書けなかった");
+            fs::write(&session.stderr, self.stderr).expect("標準エラーを書けなかった");
             if let Some(result) = self.result {
                 let logs = session.stdout.parent().expect("記録のディレクトリが無い");
                 fs::write(logs.join(RESULT_FILE), result).expect("結果を書けなかった");
@@ -334,12 +442,14 @@ mod tests {
     fn request(agent: Agent) -> Request {
         Request {
             agent,
+            model: None,
+            effort: None,
             prompt: "タスク1-1を実装する".to_owned(),
             schema: json!({"type": "object"}),
         }
     }
 
-    fn run_with(launcher: &Fake, agent: Agent) -> (tempfile::TempDir, Outcome) {
+    fn run_with(launcher: &Fake<'_>, agent: Agent) -> (tempfile::TempDir, Outcome) {
         let dir = tempfile::tempdir().expect("一時ディレクトリを作れなかった");
         let outcome = run(
             launcher,
@@ -733,5 +843,212 @@ mod tests {
     /// テストを実行しているプロセスのPATH。本物のgitを探す元にする。
     fn inherited_path() -> OsString {
         env::var_os("PATH").unwrap_or_default()
+    }
+
+    #[test]
+    fn 指定したモデルとeffortをエージェントごとの引数で1つずつ渡す() {
+        let model = korylusfactory_protocol::Model::parse("claude-opus-5-5[1m]")
+            .expect("モデルを読めなかった");
+        let logs = Path::new("/workspace/sessions/1");
+        let with = |agent| Request {
+            model: Some(model.clone()),
+            effort: Some(korylusfactory_protocol::Effort::Xhigh),
+            ..request(agent)
+        };
+
+        let claude = strings(&args(&with(Agent::Claude), logs));
+        let codex = strings(&args(&with(Agent::Codex), logs));
+
+        assert_eq!(
+            claude[claude.len() - 4..],
+            ["--model", "claude-opus-5-5[1m]", "--effort", "xhigh"],
+            "Claude Codeにモデルとeffortを渡していない: {claude:?}"
+        );
+        assert_eq!(
+            codex[codex.len() - 5..],
+            [
+                "-m",
+                "claude-opus-5-5[1m]",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "-"
+            ],
+            "Codexにモデルとeffortを渡していない: {codex:?}"
+        );
+        for (agent, plain) in [(Agent::Claude, "--model"), (Agent::Codex, "-m")] {
+            let args = strings(&args(&request(agent), logs));
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == plain || arg == "--effort" || arg == "-c"),
+                "指定していないモデルかeffortを渡した: {args:?}"
+            );
+        }
+    }
+
+    /// 確かめたClaude Codeの、知らないモデルを渡されたときの出力。
+    const CLAUDE_UNKNOWN_MODEL_STDOUT: &str = r#"{"is_error": true, "api_error_type": "not_found_error", "result": "There's an issue with the selected model (no-such-model). It may not exist or you may not have access to it."}"#;
+    const CLAUDE_UNKNOWN_MODEL_STDERR: &str =
+        "[claude-code:unrecognized_model] {\"model\":\"no-such-model\",\"query_source\":\"sdk\"}\n";
+    /// 確かめたCodexの、使えないモデルと知らないeffortを渡されたときの `--json` の出力。
+    const CODEX_UNKNOWN_MODEL: &str = "{\"type\":\"thread.started\"}\n{\"type\":\"error\",\"message\":\"The 'no-such-model' model is not supported when using Codex with a ChatGPT account.\"}\n";
+    const CODEX_UNKNOWN_EFFORT: &str = "{\"type\":\"turn.started\"}\n{\"type\":\"error\",\"message\":\"[ReasoningEffortParam] [reasoning.effort] [invalid_enum_value] Invalid value: 'max'.\"}\n";
+
+    fn run_request(fake: &Fake<'_>, request: &Request) -> Outcome {
+        let dir = tempfile::tempdir().expect("一時ディレクトリを作れなかった");
+        run(
+            fake,
+            request,
+            Path::new("/workspace"),
+            &dir.path().join("sessions/1"),
+            Duration::from_secs(60),
+            &AtomicBool::new(false),
+        )
+        .expect("セッションを起動できなかった")
+    }
+
+    fn with(
+        agent: Agent,
+        model: Option<&str>,
+        effort: Option<korylusfactory_protocol::Effort>,
+    ) -> Request {
+        Request {
+            model: model.map(|model| {
+                korylusfactory_protocol::Model::parse(model).expect("モデルを読めなかった")
+            }),
+            effort,
+            ..request(agent)
+        }
+    }
+
+    #[test]
+    fn 指定したモデルかeffortをcliが拒んだ失敗を見分けて文面を返す() {
+        let max = Some(korylusfactory_protocol::Effort::Max);
+        for (case, fake, request, expected) in [
+            (
+                "Claude Codeの知らないモデル",
+                Fake::new(CLAUDE_UNKNOWN_MODEL_STDOUT, None, Ended::Exited(1))
+                    .with_stderr(CLAUDE_UNKNOWN_MODEL_STDERR),
+                with(Agent::Claude, Some("no-such-model"), None),
+                "[claude-code:unrecognized_model]",
+            ),
+            (
+                "終了コード0でis_errorを返したClaude Codeの知らないモデル",
+                Fake::new(CLAUDE_UNKNOWN_MODEL_STDOUT, None, Ended::Exited(0))
+                    .with_stderr(CLAUDE_UNKNOWN_MODEL_STDERR),
+                with(Agent::Claude, Some("no-such-model"), None),
+                "[claude-code:unrecognized_model]",
+            ),
+            (
+                "Codexの使えないモデル",
+                Fake::new(CODEX_UNKNOWN_MODEL, None, Ended::Exited(1)),
+                with(Agent::Codex, Some("no-such-model"), None),
+                "model is not supported",
+            ),
+            (
+                "Codexの知らないeffort",
+                Fake::new(CODEX_UNKNOWN_EFFORT, None, Ended::Exited(1)),
+                with(Agent::Codex, None, max),
+                "invalid_enum_value",
+            ),
+        ] {
+            let outcome = run_request(&fake, &request);
+
+            assert!(
+                matches!(&outcome, Outcome::Rejected(text) if text.contains(expected)),
+                "{case}を値を拒んだ失敗として見分けなかった: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 指定していない値の失敗と見分けられない失敗は途中で止まったものにする() {
+        let max = Some(korylusfactory_protocol::Effort::Max);
+        for (case, fake, request) in [
+            (
+                "モデルを指定していないClaude Code",
+                Fake::new(CLAUDE_UNKNOWN_MODEL_STDOUT, None, Ended::Exited(1))
+                    .with_stderr(CLAUDE_UNKNOWN_MODEL_STDERR),
+                request(Agent::Claude),
+            ),
+            (
+                "effortだけを指定したClaude Code",
+                Fake::new(CLAUDE_UNKNOWN_MODEL_STDOUT, None, Ended::Exited(1))
+                    .with_stderr(CLAUDE_UNKNOWN_MODEL_STDERR),
+                with(Agent::Claude, None, max),
+            ),
+            (
+                "Claude Codeが標準出力に書いたモデル拒否の文面",
+                Fake::new(CLAUDE_UNKNOWN_MODEL_STDERR, None, Ended::Exited(1)),
+                with(Agent::Claude, Some("no-such-model"), None),
+            ),
+            (
+                "Claude Codeの標準エラーに引用されたモデル拒否の文面",
+                Fake::new("", None, Ended::Exited(1))
+                    .with_stderr("ログに [claude-code:unrecognized_model] と書いてありました"),
+                with(Agent::Claude, Some("no-such-model"), None),
+            ),
+            (
+                "モデルだけを指定したCodexのeffortの拒否",
+                Fake::new(CODEX_UNKNOWN_EFFORT, None, Ended::Exited(1)),
+                with(Agent::Codex, Some("gpt-5.3-codex"), None),
+            ),
+            (
+                "拒否の文字列の無いCodexの失敗",
+                Fake::new(
+                    "{\"type\":\"error\",\"message\":\"rate limited\"}\n",
+                    None,
+                    Ended::Exited(1),
+                ),
+                with(Agent::Codex, Some("gpt-5.3-codex"), max),
+            ),
+        ] {
+            let outcome = run_request(&fake, &request);
+
+            assert!(
+                matches!(outcome, Outcome::Stopped(_)),
+                "{case}を値を拒んだ失敗にした: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 値を拒んだ文面は長い行を切り詰める() {
+        let line = json!({
+            "type": "error",
+            "message": format!("The 'x' model is not supported. {}", "あ".repeat(1000)),
+        })
+        .to_string();
+        let fake = Fake::new(&line, None, Ended::Exited(1));
+
+        let outcome = run_request(&fake, &with(Agent::Codex, Some("x"), None));
+
+        let Outcome::Rejected(text) = outcome else {
+            panic!("値を拒んだ失敗として見分けなかった: {outcome:?}");
+        };
+        assert_eq!(
+            text.chars().count(),
+            REJECTED_TEXT_LIMIT,
+            "長い行を切り詰めなかった"
+        );
+    }
+
+    #[test]
+    fn 長いログの末尾にあるcliの診断を見分ける() {
+        let progress = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"確認中\"}}\n";
+        let stdout = format!("{}{CODEX_UNKNOWN_EFFORT}", progress.repeat(1024));
+        let fake = Fake::new(&stdout, None, Ended::Exited(1));
+        let request = with(
+            Agent::Codex,
+            None,
+            Some(korylusfactory_protocol::Effort::Max),
+        );
+
+        let outcome = run_request(&fake, &request);
+
+        assert!(
+            matches!(&outcome, Outcome::Rejected(text) if text.contains("[reasoning.effort] [invalid_enum_value]")),
+            "ログの末尾にある診断を見分けなかった: {outcome:?}"
+        );
     }
 }

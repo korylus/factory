@@ -180,8 +180,7 @@ pub enum VerificationKind {
 }
 
 /// 評価を、レビュードキュメントに書く表記で読み書きする。
-mod verdict {
-    use serde::de::Error as _;
+pub(super) mod verdict {
     use serde::{Deserialize, Deserializer, Serializer};
 
     use super::Verdict;
@@ -203,11 +202,14 @@ mod verdict {
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Verdict, D::Error> {
-        let value = String::deserialize(deserializer)?;
+        parse(&String::deserialize(deserializer)?)
+    }
+
+    pub(in crate::state) fn parse<E: serde::de::Error>(value: &str) -> Result<Verdict, E> {
         ALL.into_iter()
             .find(|verdict| verdict.as_str() == value)
             .ok_or_else(|| {
-                D::Error::custom(format!(
+                E::custom(format!(
                     "評価 {value:?} を読み取れません。Approve・Request Changes・Commentのいずれかを書いてください"
                 ))
             })

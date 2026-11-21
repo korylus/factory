@@ -1,8 +1,12 @@
-{% extends "layout.html" %} {% import "parts.html" as parts %} {% block content %}
+{% extends "layout.html" %} {% import "parts.html" as parts %}
+{% block scripts %}<script src="{{ crate::assets::project_status_path() }}" defer></script>{% endblock %}
+{% block content %}
 <div id="events" hx-sse:connect="{{ crate::events::PATH }}" hidden></div>
 <h1 class="px-4 text-2xl font-semibold md:px-0">プロジェクト</h1>
+<p id="project-status-announcement" class="sr-only" role="status" aria-atomic="true"></p>
 <div
   id="projects"
+  data-project-status-view
   class="flex flex-col gap-4"
   hx-get="/"
   hx-select="#projects > *"
@@ -34,7 +38,12 @@
               </p>
               {% endmatch %}{% endfor %}
             </section>
-            <div class="flex shrink-0 items-center">
+            <div
+              class="flex shrink-0 items-center"
+              data-project-name="{{ project.name }}"
+              data-project-state="{{ project.state.label() }}"
+              {% if project.state == State::Paused %}data-project-paused{% endif %}
+            >
               {% call parts::state_badge(project.state) %}{% endcall %}
             </div>
           </a>
