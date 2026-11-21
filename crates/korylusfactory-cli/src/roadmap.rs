@@ -100,7 +100,7 @@ pub fn load(runner: &dyn Runner, config: &Config, store: &Store) -> Result<Vec<E
     let topic_number = roadmap
         .topic_number
         .ok_or_else(|| Error::NoTopic(config.roadmap.url.clone()))?;
-    let candidates = queue::candidates(&roadmap.body, &config.sections)?;
+    let candidates = queue::candidates(&roadmap.body, &config.section)?;
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -331,7 +331,7 @@ mod tests {
     fn config() -> Config {
         Config {
             roadmap: Wikino::page(Kind::Roadmap, "shimbaco", 1214),
-            sections: vec!["やってる".to_owned(), "優先度: 高".to_owned()],
+            section: "やってる".to_owned(),
             done_sections: vec!["やった".to_owned()],
             project: None,
             web: None,
@@ -354,14 +354,15 @@ wikino_topic_number: 4
 ## やってる
 
 - [[下書きだけ 作業計画書]]
-
-## 優先度: 高
-
 - [[公開済み 作業計画書]]
 - [[Annict/別のトピック 作業計画書]]
 - [[まだ無い 作業計画書]]
 - [[計画書名が無い 作業計画書]]
 - [[ミュート機能]]
+
+## 優先度: 高
+
+- [[優先度の 作業計画書]]
 ";
 
     const DRAFTS: &str = r#"{"page_number":20,"title":"下書きだけ 作業計画書","topic_number":4,"topic_name":"Mewst"}
@@ -428,19 +429,19 @@ wikino_topic_number: 4
                 state: ready(20, "draft-only"),
             },
             Entry {
-                candidate: link("優先度: 高", None, "公開済み 作業計画書"),
+                candidate: link("やってる", None, "公開済み 作業計画書"),
                 state: ready(30, "published"),
             },
             Entry {
-                candidate: link("優先度: 高", Some("Annict"), "別のトピック 作業計画書"),
+                candidate: link("やってる", Some("Annict"), "別のトピック 作業計画書"),
                 state: ready(32, "other-topic"),
             },
             Entry {
-                candidate: link("優先度: 高", None, "まだ無い 作業計画書"),
+                candidate: link("やってる", None, "まだ無い 作業計画書"),
                 state: State::NotFound,
             },
             Entry {
-                candidate: link("優先度: 高", None, "計画書名が無い 作業計画書"),
+                candidate: link("やってる", None, "計画書名が無い 作業計画書"),
                 state: State::Invalid {
                     url: "https://wikino.app/s/shimbaco/pages/33".to_owned(),
                     reason: "計画書 https://wikino.app/s/shimbaco/pages/33 に計画書名の行がありません。最初の「## 」の見出しより前に「**計画書名**: <英小文字・数字・ハイフンの名前>」の行を書いてください".to_owned(),
@@ -505,7 +506,7 @@ wikino_topic_number: 4
 
     #[test]
     fn 承認とみなす節が無ければエラー() {
-        let runner = FakeWikino::new(|_| ok("---\nwikino_topic_number: 4\n---\n\n## やってる\n"));
+        let runner = FakeWikino::new(|_| ok("---\nwikino_topic_number: 4\n---\n\n## 優先度: 高\n"));
         let err = load_new(&runner).expect_err("エラーにならなかった");
         assert!(matches!(err, Error::Queue(_)), "エラー = {err:?}");
     }
@@ -598,7 +599,7 @@ wikino_topic_number: 4
     fn トピック名の有無で書き分けた同じページは最初の候補だけを残す() {
         let runner = FakeWikino::new(|args| match (args[0].as_str(), args[1].as_str()) {
             ("draft", "get") if args[2] == "1214" => ok(
-                "---\nwikino_topic_number: 4\n---\n\n## やってる\n\n- [[退会機能 作業計画書]]\n\n## 優先度: 高\n\n- [[Mewst/退会機能 作業計画書]]\n- [[次の 作業計画書]]\n",
+                "---\nwikino_topic_number: 4\n---\n\n## やってる\n\n- [[退会機能 作業計画書]]\n- [[Mewst/退会機能 作業計画書]]\n- [[次の 作業計画書]]\n",
             ),
             ("draft", "list") => ok(concat!(
                 r#"{"page_number":20,"title":"退会機能 作業計画書","topic_number":4,"topic_name":"Mewst"}"#,
@@ -619,7 +620,7 @@ wikino_topic_number: 4
                     state: ready(20, "withdraw"),
                 },
                 Entry {
-                    candidate: link("優先度: 高", None, "次の 作業計画書"),
+                    candidate: link("やってる", None, "次の 作業計画書"),
                     state: ready(21, "next"),
                 },
             ],
