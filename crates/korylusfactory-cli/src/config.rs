@@ -526,7 +526,7 @@ mod tests {
             r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "section": "着手"}"#,
         );
         let config = load(root.path()).expect("設定を読めなかった");
-        assert_eq!(config.section, "着手");
+        assert_eq!(config.section, "着手", "書いた承認とみなす節を読まなかった");
     }
 
     #[test]
