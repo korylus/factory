@@ -17,6 +17,25 @@ pub const MIGRATIONS: &[&str] = &[
         report TEXT NOT NULL,
         received_at TEXT NOT NULL
     ) STRICT",
+    // プロジェクトごとに、人間が決めた設定を1行で持つ。行が無いプロジェクトは稼働として扱う。
+    // 設定の正本はこのDBのため、報告の写しと違い、項目を列に分けて制約で守る。
+    "CREATE TABLE project_settings (
+        project TEXT PRIMARY KEY NOT NULL,
+        paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+        updated_at TEXT NOT NULL
+    ) STRICT",
+    // プロジェクトと枠ごとに、人間が決めたエージェントの設定を1行で持つ。行が無い枠は既定として扱う。
+    // 後続の版が枠を足せるよう、枠にはCHECKを付けず、知らない枠の行はウェブアプリが無視する。
+    // モデルの文字の規則はSQLiteで確かめられないため、アプリが確かめる。
+    "CREATE TABLE agent_settings (
+        project TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        agent TEXT NOT NULL CHECK (agent IN ('claude', 'codex')),
+        model TEXT CHECK (model IS NULL OR length(model) BETWEEN 1 AND 64),
+        effort TEXT CHECK (effort IS NULL OR effort IN ('low', 'medium', 'high', 'xhigh', 'max')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project, slot)
+    ) STRICT",
 ];
 
 /// DBを開けないか、DBの操作に失敗したときのエラー。
@@ -68,7 +87,7 @@ pub enum Error {
 
 /// ウェブアプリのDB。接続を1つ持ち、操作を順に行う。
 ///
-/// 書き込むのはディレクターからの状態の報告だけで、要求の数も少ないため、接続を分けずに1つで足りる。
+/// 書き込むのはディレクターからの状態の報告と人間が変える設定だけで、要求の数も少ないため、接続を分けずに1つで足りる。
 #[derive(Debug, Clone)]
 pub struct Database {
     connection: Arc<Mutex<Connection>>,

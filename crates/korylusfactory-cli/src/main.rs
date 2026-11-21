@@ -11,7 +11,7 @@ use korylusfactory_cli::human_queue::{WikinoStore, command as queue};
 use korylusfactory_cli::process::System;
 use korylusfactory_cli::start::{self, Start, SystemClock, Timing};
 use korylusfactory_cli::version::{self, Build};
-use korylusfactory_cli::{completion, config, describe, resume, roadmap, status, web};
+use korylusfactory_cli::{completion, config, describe, operation, resume, roadmap, status, web};
 use korylusfactory_core::state::{Store, Wait, WaitKind};
 
 /// バージョン番号に、ビルド元のコミットとビルドした日を添えた文字列。
@@ -132,20 +132,18 @@ fn main() -> ExitCode {
 
 /// `korylusfactory start` を、今のディレクトリをプロジェクトのルートとして実行する。
 ///
-/// ウェブに報告する場合は、Ctrl+Cでセッションと報告の送信を片付ける。
+/// Ctrl+CかSIGTERMでセッションを取り消して記録し、ウェブに報告する場合は最後の送信を待つ。
 fn run_start() -> Result<(), Box<dyn Error>> {
     let root = env::current_dir()?;
     let config = config::load(&root)?;
     let cancel = Arc::new(AtomicBool::new(false));
-    let clock = if config.web.is_some() {
-        let interrupt = signal_hook::consts::SIGINT;
-        // 通常のキャンセルで待ちきれないときは、2回目のCtrl+Cで既定の動作を選べる。
-        signal_hook::flag::register_conditional_default(interrupt, Arc::clone(&cancel))?;
-        signal_hook::flag::register(interrupt, Arc::clone(&cancel))?;
-        SystemClock::new(&cancel)
-    } else {
-        SystemClock::default()
-    };
+    // Dockerなどがサービスを止めるときに送るSIGTERMも、Ctrl+Cと同じ取り消しの合図にする。
+    // 取り消しの合図を受けたあとは、どちらのシグナルでも既定の動作で終わり、送信を待ちきれないときに止められる。
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register_conditional_default(signal, Arc::clone(&cancel))?;
+        signal_hook::flag::register(signal, Arc::clone(&cancel))?;
+    }
+    let clock = SystemClock::new(&cancel);
     let build = Build::current();
     let start = Start {
         runner: &System,
@@ -185,6 +183,21 @@ fn run_status(json: bool) -> Result<(), Box<dyn Error>> {
     }
     let root = env::current_dir()?;
     let config = config::load(&root)?;
+    // 最後に読めた設定を読めないときも、ほかの表示は続ける。
+    let saved = if config.web.is_some() {
+        operation::load(&root).unwrap_or_else(|err| {
+            eprintln!("korylusfactory: {}", describe(&err));
+            None
+        })
+    } else {
+        None
+    };
+    if !json {
+        let time_zone = TimeZone::system();
+        stdout.write_all(status::operation_text(saved.as_ref(), &time_zone).as_bytes())?;
+        stdout.write_all(status::agents_text(saved.as_ref(), &time_zone).as_bytes())?;
+        stdout.flush()?;
+    }
     let store = Store::new(&root);
     let entries = roadmap::load(&runner, &config, &store)?;
     let progress: Vec<status::Progress> = store
@@ -210,7 +223,7 @@ fn run_status(json: bool) -> Result<(), Box<dyn Error>> {
     if json {
         serde_json::to_writer_pretty(
             &mut stdout,
-            &status::Report::new(&build, &freshness, &entries, &progress),
+            &status::Report::new(&build, &freshness, saved.as_ref(), &entries, &progress),
         )?;
         stdout.write_all(b"\n")?;
     } else {

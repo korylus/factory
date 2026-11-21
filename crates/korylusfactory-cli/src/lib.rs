@@ -10,6 +10,7 @@ pub mod config;
 pub mod human_queue;
 pub mod instruction;
 pub mod notify;
+pub mod operation;
 pub mod process;
 pub mod resume;
 pub mod roadmap;

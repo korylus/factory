@@ -34,6 +34,7 @@ pub fn for_wait(
         WaitKind::Review => Scene::Review(findings(state, root)?),
         WaitKind::ReviewLimit => Scene::ReviewLimit,
         WaitKind::RetryLimit => Scene::RetryLimit,
+        WaitKind::AgentSettings => Scene::AgentSettings,
         WaitKind::Question => Scene::Question,
         WaitKind::Report => Scene::Report,
     };
@@ -160,6 +161,7 @@ mod tests {
             (WaitKind::Branch, Scene::Branch),
             (WaitKind::ReviewLimit, Scene::ReviewLimit),
             (WaitKind::RetryLimit, Scene::RetryLimit),
+            (WaitKind::AgentSettings, Scene::AgentSettings),
             (WaitKind::Question, Scene::Question),
             (WaitKind::Report, Scene::Report),
         ];

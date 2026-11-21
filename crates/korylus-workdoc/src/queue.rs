@@ -51,6 +51,8 @@ pub enum Scene {
     ReviewLimit,
     /// 同じステップのやり直しが、上限の回数に達した。
     RetryLimit,
+    /// 担当ごとのエージェントの設定 (モデルかeffort) を、セッションのCLIが受け付けなかった。
+    AgentSettings,
     /// セッションが、人間の判断が要ると返して終わった。
     Question,
     /// 作業報告書を、人間が確認する。
@@ -70,6 +72,7 @@ impl Scene {
             Scene::Review(_) => "レビューの要人間判断の指摘",
             Scene::ReviewLimit => "レビューの上限",
             Scene::RetryLimit => "やり直しの上限",
+            Scene::AgentSettings => "エージェントの設定",
             Scene::Question => "セッションからの質問",
             Scene::Report => "作業報告書の確認",
             Scene::PlanUnreadable => "作業計画書を読み取れない",
@@ -90,7 +93,7 @@ impl Scene {
             Scene::HumanTask => format!(
                 "タスクを済ませ、作業計画書のタスクにチェックを付けてから、このページを公開してください。\n{RESUME}"
             ),
-            Scene::Branch | Scene::RetryLimit => format!(
+            Scene::Branch | Scene::RetryLimit | Scene::AgentSettings => format!(
                 "理由に書かれた原因を取り除いてから、このページを公開してください。\n{RESUME}"
             ),
             Scene::Report => format!(
@@ -368,6 +371,7 @@ mod tests {
             review(),
             Scene::ReviewLimit,
             Scene::RetryLimit,
+            Scene::AgentSettings,
             Scene::Question,
             Scene::Report,
             Scene::PlanUnreadable,
@@ -475,6 +479,7 @@ mod tests {
             (Scene::HumanTask, "作業計画書のタスクにチェックを付けてから"),
             (Scene::Branch, "原因を取り除いてから"),
             (Scene::RetryLimit, "原因を取り除いてから"),
+            (Scene::AgentSettings, "原因を取り除いてから"),
             (Scene::Report, "フィードバック対応のフェーズを足してから"),
             (Scene::PlanUnreadable, "公開は要りません"),
             (Scene::NotMerged, "公開は要りません"),

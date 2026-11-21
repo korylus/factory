@@ -7,7 +7,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use korylusfactory_core::flow::{Next, Task};
-use korylusfactory_core::state::{HumanAnswer, PlanState, Reviewer, TaskRecord};
+use korylusfactory_core::state::{HumanAnswer, PlanState, Reviewer, Slot, TaskRecord};
+use korylusfactory_protocol as protocol;
 use serde_json::{Value, json};
 
 /// 指示を作れないときのエラー。
@@ -27,12 +28,52 @@ pub enum Agent {
     Codex,
 }
 
+impl From<protocol::Agent> for Agent {
+    fn from(agent: protocol::Agent) -> Self {
+        match agent {
+            protocol::Agent::Claude => Agent::Claude,
+            protocol::Agent::Codex => Agent::Codex,
+        }
+    }
+}
+
+/// 状態ファイルの枠slotを、ウェブアプリとやり取りする枠にする。
+pub fn protocol_slot(slot: Slot) -> protocol::Slot {
+    match slot {
+        Slot::Implementer => protocol::Slot::Implementer,
+        Slot::ReviewerOdd => protocol::Slot::ReviewerOdd,
+        Slot::ReviewerEven => protocol::Slot::ReviewerEven,
+    }
+}
+
 impl Agent {
-    /// レビュアーreviewerのセッションを動かすエージェントを返す。
-    pub fn reviewer(reviewer: Reviewer) -> Self {
-        match reviewer {
-            Reviewer::Codex => Agent::Codex,
-            Reviewer::Claude => Agent::Claude,
+    /// 表示名 (例: `Claude Code`)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Codex => "Codex",
+        }
+    }
+
+    /// エージェント・モデル・effortを端末に出す形にする。
+    pub(crate) fn setting_label(
+        self,
+        model: Option<&protocol::Model>,
+        effort: Option<protocol::Effort>,
+    ) -> String {
+        format!(
+            "{}・{}・{}",
+            self.label(),
+            model.map_or("既定のモデル", protocol::Model::as_str),
+            effort.map_or("既定のeffort", protocol::Effort::value),
+        )
+    }
+
+    /// このエージェントが動かしたレビューを、状態ファイルのレビューの記録に書くときのレビュアー。
+    pub fn reviewer(self) -> Reviewer {
+        match self {
+            Agent::Codex => Reviewer::Codex,
+            Agent::Claude => Reviewer::Claude,
         }
     }
 }
@@ -42,6 +83,10 @@ impl Agent {
 pub struct Request {
     /// セッションを動かすエージェント。
     pub agent: Agent,
+    /// 指定するモデル。`None` ならCLIの既定値で動かす。
+    pub model: Option<protocol::Model>,
+    /// 指定するeffort。`None` ならCLIの既定値で動かす。
+    pub effort: Option<protocol::Effort>,
     /// セッションへの指示。
     pub prompt: String,
     /// セッションが返す結果のJSON Schema。
@@ -61,60 +106,34 @@ pub struct Context<'a> {
     pub answers: &'a [HumanAnswer],
 }
 
-/// 次に行うことnextのセッションに頼むことを、状態stateと場所ctxから作る。
+/// 次に行うことnextのセッションに、検証を通した枠の設定settingで頼むことを、状態stateと場所ctxから作る。
 ///
 /// セッションを起動しないこと (タスクの準備・人間待ち・終わり) なら `None` を返す。
-pub fn build(next: &Next, state: &PlanState, ctx: &Context<'_>) -> Result<Option<Request>, Error> {
+pub fn build(
+    next: &Next,
+    state: &PlanState,
+    ctx: &Context<'_>,
+    setting: &protocol::AgentSetting,
+) -> Result<Option<Request>, Error> {
     let record = |task: &Task| {
         state
             .task_record(&task.id)
             .ok_or_else(|| Error::MissingRecord(task.id.clone()))
     };
-    let (agent, steps, kind) = match next {
+    let (steps, kind) = match next {
         Next::Prepare { .. } | Next::Wait(_) | Next::Finished => return Ok(None),
-        Next::Implement { task } => (
-            Agent::Claude,
-            implement(ctx, task, record(task)?),
-            Kind::Implement,
-        ),
-        Next::Work { task } => (Agent::Claude, work(ctx, task), Kind::Plain),
-        Next::Review { task, reviewer, .. } => (
-            Agent::reviewer(*reviewer),
-            review(ctx, task, record(task)?),
-            Kind::Plain,
-        ),
-        Next::Fix {
-            task,
-            reviewer,
-            doc,
-        } => (
-            Agent::reviewer(*reviewer),
-            fix(task, record(task)?, doc),
-            Kind::Plain,
-        ),
-        Next::Report { previous } => (
-            Agent::Claude,
-            report(ctx, state, previous.as_deref()),
-            Kind::Report,
-        ),
-        Next::ReportReview {
-            url,
-            reviewer,
-            prefix,
-            ..
-        } => (
-            Agent::reviewer(*reviewer),
-            report_review(ctx, url, prefix),
-            Kind::Plain,
-        ),
-        Next::ReportFix { url, reviewer, doc } => (
-            Agent::reviewer(*reviewer),
-            report_fix(url, doc),
-            Kind::Plain,
-        ),
+        Next::Implement { task } => (implement(ctx, task, record(task)?), Kind::Implement),
+        Next::Work { task } => (work(ctx, task), Kind::Plain),
+        Next::Review { task, .. } => (review(ctx, task, record(task)?), Kind::Plain),
+        Next::Fix { task, doc, .. } => (fix(task, record(task)?, doc), Kind::Plain),
+        Next::Report { previous } => (report(ctx, state, previous.as_deref()), Kind::Report),
+        Next::ReportReview { url, prefix, .. } => (report_review(ctx, url, prefix), Kind::Plain),
+        Next::ReportFix { url, doc, .. } => (report_fix(url, doc), Kind::Plain),
     };
     Ok(Some(Request {
-        agent,
+        agent: setting.agent.into(),
+        model: setting.model.clone(),
+        effort: setting.effort,
         prompt: prompt(ctx, &steps, kind),
         schema: kind.schema(),
     }))
@@ -424,6 +443,10 @@ mod tests {
         state
     }
 
+    fn claude() -> protocol::AgentSetting {
+        protocol::Slot::Implementer.default_setting()
+    }
+
     fn context(retry: &[String]) -> Context<'_> {
         Context {
             plan_url: URL,
@@ -434,7 +457,11 @@ mod tests {
     }
 
     fn build_ok(next: &Next, state: &PlanState, retry: &[String]) -> Request {
-        build(next, state, &context(retry))
+        // 枠の既定のエージェントで頼む。セッションを起動しないことでは使われない。
+        let slot = next
+            .slot()
+            .map_or(protocol::Slot::Implementer, protocol_slot);
+        build(next, state, &context(retry), &slot.default_setting())
             .expect("指示を作れなかった")
             .expect("セッションに頼むことが無い")
     }
@@ -501,12 +528,12 @@ mod tests {
     }
 
     #[test]
-    fn レビューと修正はレビュアーに応じたエージェントに頼み_別のリポジトリはrepoを渡す() {
+    fn レビューと修正は枠の既定のエージェントに頼み_別のリポジトリはrepoを渡す() {
         let state = state();
         let review = build_ok(
             &Next::Review {
                 task: task("1-1"),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 number: 1,
                 prefix: "korylus-tools-demo-1-1".to_owned(),
                 repo: Some(PathBuf::from("/korylus-tools")),
@@ -526,7 +553,7 @@ mod tests {
         let fix = build_ok(
             &Next::Fix {
                 task: task("1-1"),
-                reviewer: Reviewer::Claude,
+                slot: Slot::ReviewerEven,
                 doc: PathBuf::from("docs/private/reviews/korylus-tools-demo-1-1-002.md"),
             },
             &state,
@@ -582,7 +609,7 @@ mod tests {
         let review = build_ok(
             &Next::ReportReview {
                 url: "https://wikino.app/s/shimbaco/pages/2940".to_owned(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 number: 1,
                 prefix: "demo-report".to_owned(),
             },
@@ -616,7 +643,7 @@ mod tests {
             answers: &answers,
             ..context(&[])
         };
-        let request = build(&Next::Work { task: task("1-1") }, &state(), &ctx)
+        let request = build(&Next::Work { task: task("1-1") }, &state(), &ctx, &claude())
             .expect("指示を作れなかった")
             .expect("頼むことが無かった");
         assert!(
@@ -664,7 +691,7 @@ mod tests {
             Next::Finished,
         ] {
             assert_eq!(
-                build(&next, &state, &context(&[])).expect("指示を作れなかった"),
+                build(&next, &state, &context(&[]), &claude()).expect("指示を作れなかった"),
                 None,
                 "{next:?}"
             );
@@ -677,11 +704,32 @@ mod tests {
             &Next::Implement { task: task("1-9") },
             &state(),
             &context(&[]),
+            &claude(),
         )
         .expect_err("記録の無いタスクの指示を作った");
         assert!(
             matches!(&err, Error::MissingRecord(id) if id == "1-9"),
             "エラー = {err:?}"
+        );
+    }
+
+    #[test]
+    fn ウェブアプリのエージェントからセッションのエージェントとレビュアーを決める() {
+        let agents: Vec<(Agent, Reviewer)> = protocol::Agent::ALL
+            .into_iter()
+            .map(|agent| {
+                let agent = Agent::from(agent);
+                (agent, agent.reviewer())
+            })
+            .collect();
+
+        assert_eq!(
+            agents,
+            [
+                (Agent::Claude, Reviewer::Claude),
+                (Agent::Codex, Reviewer::Codex)
+            ],
+            "エージェントとレビュアーの対応が違う"
         );
     }
 }

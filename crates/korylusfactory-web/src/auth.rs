@@ -11,18 +11,22 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::api::{self, Problem};
 use crate::config::{Config, DevIdentity};
+use crate::page;
 
 /// exe.devが、ログインしている人のメールアドレスを付けるヘッダー。
 pub const EMAIL_HEADER: HeaderName = HeaderName::from_static("x-exedev-email");
 
 /// exe.devが、peer連携で呼び出し元のVM名を付けるヘッダー。
 pub const SOURCE_VM_HEADER: HeaderName = HeaderName::from_static("x-exedev-source-vm");
+
+/// ブラウザが、要求を送らせたページのオリジンと送り先との関係を付けるヘッダー。
+pub const SEC_FETCH_SITE_HEADER: HeaderName = HeaderName::from_static("sec-fetch-site");
 
 /// 401の応答に付ける認証の要求。exe.devのプロキシが返すものと同じにする。
 const CHALLENGE: &str =
@@ -155,6 +159,19 @@ pub async fn require_human(request: Request, next: Next) -> Response {
         Some(Principal::Human { .. }) => next.run(request).await,
         _ => Rejection::Forbidden.respond(request.uri().path()),
     }
+}
+
+/// 人間の状態を変える要求 (GET・HEAD以外) を、同じオリジンから送られたものだけに限るミドルウェア。
+///
+/// 人間の認証はexe.devのプロキシのCookieで行い、その属性はウェブアプリから決められない。
+/// ほかのサイトに置かれたフォームから送らせた要求 (CSRF) を拒むため、ブラウザが付ける `Sec-Fetch-Site` が `same-origin` の要求だけを通し、それ以外は403の画面を返す。
+/// [`require_human`] の内側に置く。
+pub async fn require_same_origin(request: Request, next: Next) -> Response {
+    let safe = matches!(*request.method(), Method::GET | Method::HEAD);
+    if safe || single(request.headers(), &SEC_FETCH_SITE_HEADER) == Ok(Some("same-origin")) {
+        return next.run(request).await;
+    }
+    page::forbidden()
 }
 
 /// ディレクターだけが呼べるようにするミドルウェア。[`authenticate`] の内側に置く。

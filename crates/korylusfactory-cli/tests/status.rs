@@ -191,3 +191,72 @@ fn jsonで出すときは標準出力の全体を1つのjsonにする() {
         "進行中の作業計画書が期待と異なる"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn ウェブ設定を外すと保存済みの停止をstatusに出さない() {
+    use korylusfactory_cli::{config, operation};
+    use serde_json::{Value, json};
+
+    let project = project();
+    let root = project.root.path();
+    let read_at = "2026-11-20T00:00:00Z";
+    operation::save(
+        root,
+        &operation::Saved {
+            agents: std::collections::BTreeMap::new(),
+            paused: true,
+            read_at: read_at.parse().expect("時刻を読めなかった"),
+        },
+    )
+    .expect("以前の停止の設定を書けなかった");
+
+    let mut settings = json!({"roadmap": "https://wikino.app/s/shimbaco/pages/1214", "web": {"url": "https://factory.example.com"}});
+    for with_web in [true, false] {
+        std::fs::write(root.join(config::CONFIG_PATH), settings.to_string())
+            .expect("設定ファイルを書けなかった");
+
+        let output = korylusfactory(root, &["status"], Some(project.path.as_os_str()));
+        assert!(
+            output.status.success(),
+            "statusが失敗した: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("標準出力がUTF-8ではない");
+        assert_eq!(
+            stdout.contains("ウェブアプリの設定で停止しています"),
+            with_web,
+            "停止の表示がウェブ設定と合わない"
+        );
+
+        let output = korylusfactory(root, &["status", "--json"], Some(project.path.as_os_str()));
+        assert!(
+            output.status.success(),
+            "status --jsonが失敗した: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let got: Value =
+            serde_json::from_slice(&output.stdout).expect("標準出力をJSONとして読めなかった");
+        let expected = if with_web {
+            json!({
+                "paused": true,
+                "agents": {
+                    "implementer": {"agent": "claude"},
+                    "reviewer_odd": {"agent": "codex"},
+                    "reviewer_even": {"agent": "claude"}
+                },
+                "read_at": read_at
+            })
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            got["operation"], expected,
+            "稼働設定のJSONがウェブ設定と合わない"
+        );
+        settings
+            .as_object_mut()
+            .expect("設定がオブジェクトではない")
+            .remove("web");
+    }
+}

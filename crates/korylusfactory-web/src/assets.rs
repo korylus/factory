@@ -44,6 +44,22 @@ static THEME: LazyLock<Asset> = LazyLock::new(|| {
     )
 });
 
+static SETTINGS: LazyLock<Asset> = LazyLock::new(|| {
+    Asset::new(
+        "settings.js",
+        include_bytes!("../static/settings.js"),
+        "text/javascript; charset=utf-8",
+    )
+});
+
+static PROJECT_STATUS: LazyLock<Asset> = LazyLock::new(|| {
+    Asset::new(
+        "project-status.js",
+        include_bytes!("../static/project-status.js"),
+        "text/javascript; charset=utf-8",
+    )
+});
+
 /// ハッシュを入れた名前で配信するファイル。
 #[derive(Debug)]
 struct Asset {
@@ -82,6 +98,16 @@ pub(crate) fn theme_path() -> &'static str {
     &THEME.path
 }
 
+/// プロジェクト設定のフォームを補助するスクリプトの配信パス。テンプレートから呼ぶ。
+pub(crate) fn settings_path() -> &'static str {
+    &SETTINGS.path
+}
+
+/// プロジェクトの状態の変化を通知するスクリプトの配信パス。テンプレートから呼ぶ。
+pub(crate) fn project_status_path() -> &'static str {
+    &PROJECT_STATUS.path
+}
+
 /// 内容のハッシュを、拡張子の前に入れた名前を返す (`app.css` → `app.0123456789abcdef.css`)。
 fn hashed_name(name: &str, body: &[u8]) -> String {
     // 名前はこの実行ファイルの中だけで使うため、版によってハッシュの値が変わる標準のハッシュで足りる。
@@ -96,9 +122,16 @@ fn hashed_name(name: &str, body: &[u8]) -> String {
 
 /// ハッシュを入れた名前のファイルを返す。知らない名前には404の画面を返す。
 pub async fn serve(Path(file): Path<String>) -> Response {
-    let asset = [&*STYLESHEET, &*HTMX, &*SSE, &*THEME]
-        .into_iter()
-        .find(|asset| asset.path.strip_prefix(PREFIX) == Some(file.as_str()));
+    let asset = [
+        &*STYLESHEET,
+        &*HTMX,
+        &*SSE,
+        &*THEME,
+        &*SETTINGS,
+        &*PROJECT_STATUS,
+    ]
+    .into_iter()
+    .find(|asset| asset.path.strip_prefix(PREFIX) == Some(file.as_str()));
     let Some(asset) = asset else {
         return page::not_found();
     };
@@ -129,6 +162,8 @@ mod tests {
             (htmx_path(), "/static/htmx.min.", ".js"),
             (sse_path(), "/static/hx-sse.min.", ".js"),
             (theme_path(), "/static/theme.", ".js"),
+            (settings_path(), "/static/settings.", ".js"),
+            (project_status_path(), "/static/project-status.", ".js"),
         ] {
             let hash = path
                 .strip_prefix(prefix)

@@ -8,11 +8,16 @@ use std::hash::BuildHasher;
 
 use axum::http::Uri;
 use jiff::{SignedDuration, Timestamp};
-use korylusfactory_protocol::{PlanProgress, StatusReport, TaskStatus};
+use korylusfactory_protocol::{Agent, PlanProgress, Session, StatusReport, TaskStatus};
 use rusqlite::{OptionalExtension as _, Row};
 
+use crate::agents::agent_label;
 use crate::config::Director;
 use crate::db::{self, Database};
+use crate::settings::Operation;
+
+/// 停止中のプロジェクトに添える文言。
+const PAUSED: &str = "停止しています";
 
 /// 最後の報告からこの時間を超えて報告が届いていないプロジェクトを、不通とみなす。
 pub const UNREACHABLE_AFTER: SignedDuration = SignedDuration::from_mins(5);
@@ -24,9 +29,11 @@ pub enum State {
     Waiting,
     /// 報告が届いていない。
     Unreachable,
-    /// セッションを実行しているか、進行中の作業計画書がある。
+    /// セッションを実行しているか、停止を反映せずに進行中の作業計画書を進めている。
     Running,
-    /// 進めている作業計画書が無い。
+    /// ウェブアプリの設定で停止したことを、ディレクターが反映して待っている。
+    Paused,
+    /// 停止を反映しておらず、進めている作業計画書も無い。
     Idle,
 }
 
@@ -37,6 +44,7 @@ impl State {
             State::Waiting => "人間待ち",
             State::Unreachable => "不通",
             State::Running => "実行中",
+            State::Paused => "停止中",
             State::Idle => "計画書なし",
         }
     }
@@ -47,7 +55,7 @@ impl State {
             State::Waiting => "warning",
             State::Unreachable => "destructive",
             State::Running => "info",
-            State::Idle => "secondary",
+            State::Paused | State::Idle => "secondary",
         }
     }
 }
@@ -99,7 +107,12 @@ pub fn state(received: Option<&Received>, now: Timestamp) -> State {
     let report = &received.report;
     if report.progress.iter().any(|plan| plan.wait.is_some()) {
         State::Waiting
-    } else if report.running || !report.progress.is_empty() {
+    } else if report.running {
+        // 停止に切り替えられても、実行中のセッションが終わるまでは実行中として出す。
+        State::Running
+    } else if report.paused {
+        State::Paused
+    } else if !report.progress.is_empty() {
         State::Running
     } else {
         State::Idle
@@ -126,6 +139,7 @@ pub fn list<S: BuildHasher>(
 pub fn item(name: &str, received: Option<&Received>, now: Timestamp) -> Item {
     let state = state(received, now);
     let progress = received.map_or(&[][..], |received| &received.report.progress[..]);
+    let upcoming = received.map_or(&[][..], |received| &received.report.upcoming[..]);
     let parts = match state {
         State::Waiting => {
             let plan = progress.iter().find(|plan| plan.wait.is_some());
@@ -158,6 +172,17 @@ pub fn item(name: &str, received: Option<&Received>, now: Timestamp) -> Item {
                 parts
             }
             None => vec![Part::Text("セッションを実行しています".to_owned())],
+        },
+        State::Paused => match (progress.first(), upcoming.first()) {
+            (Some(plan), _) => vec![
+                Part::PlanTitle(plan.title.clone()),
+                Part::Text(PAUSED.to_owned()),
+            ],
+            (None, Some(plan)) => vec![
+                Part::PlanTitle(plan.title.clone()),
+                Part::Text(format!("次に進める作業計画書 ・ {PAUSED}")),
+            ],
+            (None, None) => vec![Part::Text(PAUSED.to_owned())],
         },
         State::Idle => vec![Part::Text("進めている作業計画書はありません".to_owned())],
     };
@@ -206,7 +231,7 @@ fn waiting(plan: &PlanProgress) -> String {
 }
 
 /// `<time datetime>` に入れる時刻。HTMLの日時の書式は秒の端数を3桁までしか許さないため、秒で切り捨てる。
-fn datetime(time: Timestamp) -> String {
+pub fn datetime(time: Timestamp) -> String {
     Timestamp::from_second(time.as_second())
         .unwrap_or(time)
         .to_string()
@@ -329,6 +354,15 @@ pub(crate) fn name_from_segment(segment: &str) -> &str {
     }
 }
 
+/// パスの区切りが設定にあるプロジェクトを指していれば、設定のプロジェクト名を返す。
+pub fn configured<'a>(directors: &'a [Director], segment: &str) -> Option<&'a str> {
+    let name = name_from_segment(segment);
+    directors
+        .iter()
+        .find(|director| director.project == name)
+        .map(|director| director.project.as_str())
+}
+
 fn dot_segment(name: &str) -> bool {
     matches!(name.trim_start_matches('~'), "." | "..")
 }
@@ -352,12 +386,37 @@ pub struct Detail {
     pub name: String,
     /// プロジェクトの状態。
     pub state: State,
+    /// ウェブアプリの稼働の設定を、ディレクターがまだ反映していないときに添える文言。
+    pub mismatch: Option<&'static str>,
     /// 最後に報告を受け取った時刻。まだ受け取っていなければ無い。
     pub last_contact: Option<Contact>,
     /// 進行中の作業計画書。
     pub plans: Vec<Plan>,
     /// これから進める作業計画書。
     pub upcoming: Vec<Link>,
+    /// 進行中の作業計画書で直近に起動したセッション。新しい順に [`RECENT_SESSIONS`] 件まで並べる。
+    pub sessions: Vec<SessionRow>,
+}
+
+/// プロジェクトの画面に並べる、最近のセッションの件数。
+pub const RECENT_SESSIONS: usize = 5;
+
+/// 最近のセッションの1行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// 見出し (例: `1-1のレビュー (1回目)`)。
+    pub heading: String,
+    /// 見出しの下に ` ・ ` で区切って並べる詳細。
+    pub parts: Vec<SessionPart>,
+}
+
+/// 最近のセッションの詳細の1つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPart {
+    /// 文言。
+    Text(String),
+    /// 指定したモデル。識別子のため等幅の書体で出す。
+    Model(String),
 }
 
 /// 最後に報告を受け取った時刻。
@@ -424,9 +483,27 @@ pub struct ReportLink {
     pub id: String,
 }
 
-/// プロジェクトの画面の中身を作る。
-pub fn detail(name: &str, received: Option<&Received>, now: Timestamp) -> Detail {
+/// プロジェクトの画面の中身を作る。operationは、ウェブアプリに保存した稼働の設定。
+pub fn detail(
+    name: &str,
+    received: Option<&Received>,
+    operation: Operation,
+    now: Timestamp,
+) -> Detail {
     let state = state(received, now);
+    let mismatch = match received {
+        // 不通のときは、ディレクターが設定を読めないため食い違いを添えない。
+        Some(received) if state != State::Unreachable => {
+            match (operation.is_paused(), received.report.paused) {
+                (true, false) => {
+                    Some("停止に切り替えました。実行中のセッションが終わったところで停止します")
+                }
+                (false, true) => Some("稼働に切り替えました。ディレクターが設定を読むと再開します"),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let last_contact = received.map(|received| Contact {
         datetime: datetime(received.received_at),
         ago: ago(received.received_at, now),
@@ -452,12 +529,86 @@ pub fn detail(name: &str, received: Option<&Received>, now: Timestamp) -> Detail
             .collect();
         (plans, upcoming)
     });
+    let sessions = received.map_or_default(|received| sessions(&received.report.progress, now));
     Detail {
         name: name.to_owned(),
         state,
+        mismatch,
         last_contact,
         plans,
         upcoming,
+        sessions,
+    }
+}
+
+/// 進行中の作業計画書のセッションを、起動した時刻の新しい順に [`RECENT_SESSIONS`] 件まで、画面の行にする。
+///
+/// 起動した時刻を読めないセッションは最後に回す。
+fn sessions(progress: &[PlanProgress], now: Timestamp) -> Vec<SessionRow> {
+    let mut sessions: Vec<&Session> = progress.iter().flat_map(|plan| &plan.sessions).collect();
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at.parse::<Timestamp>().ok()));
+    sessions
+        .into_iter()
+        .take(RECENT_SESSIONS)
+        .map(|session| session_row(session, now))
+        .collect()
+}
+
+/// セッション1つを画面の行にする。
+///
+/// 詳細は、担当・エージェント・モデル・effort (指定したときだけ)・所要時間・結果の順に並べる。
+/// 実行中のセッションは、所要時間の代わりに起動してからの経過時間を出し、結果の代わりに「実行中」と出す。
+fn session_row(session: &Session, now: Timestamp) -> SessionRow {
+    let mut heading = match &session.task {
+        Some(task) => format!("{task}の{}", session.step.label),
+        None => session.step.label.clone(),
+    };
+    if let Some(review) = session.review {
+        let _ = write!(heading, " ({review}回目)");
+    }
+    let mut parts = vec![
+        SessionPart::Text(session.role.label.clone()),
+        // この版の知らないエージェントは、ディレクターが送った値をそのまま出す。
+        SessionPart::Text(Agent::from_value(&session.agent).map_or_else(
+            || session.agent.clone(),
+            |agent| agent_label(agent).to_owned(),
+        )),
+        session.model.as_ref().map_or_else(
+            || SessionPart::Text("既定のモデル".to_owned()),
+            |model| SessionPart::Model(model.clone()),
+        ),
+    ];
+    parts.extend(session.effort.clone().map(SessionPart::Text));
+    let running = session.ended_at.is_none() && session.result.is_none();
+    let started_at = session.started_at.parse::<Timestamp>().ok();
+    let ended_at = session.ended_at.as_deref().map(str::parse::<Timestamp>);
+    match (started_at, ended_at) {
+        (Some(started_at), None) if running => {
+            parts.push(SessionPart::Text(duration(started_at, now)));
+        }
+        (Some(started_at), Some(Ok(ended_at))) => {
+            parts.push(SessionPart::Text(duration(started_at, ended_at)));
+        }
+        _ => {}
+    }
+    match &session.result {
+        Some(result) => parts.push(SessionPart::Text(result.label.clone())),
+        None if running => parts.push(SessionPart::Text("実行中".to_owned())),
+        None => {}
+    }
+    SessionRow { heading, parts }
+}
+
+/// fromからtoまでの時間を、所要時間の表現 (例: `12分`・`1時間5分`) にする。
+pub fn duration(from: Timestamp, to: Timestamp) -> String {
+    // 時計のずれで終わりが始まりより前になったときも、1分未満に含める。
+    let minutes = to.duration_since(from).as_secs().max(0) / 60;
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    match (hours, minutes) {
+        (0, 0) => "1分未満".to_owned(),
+        (0, minutes) => format!("{minutes}分"),
+        (hours, 0) => format!("{hours}時間"),
+        (hours, minutes) => format!("{hours}時間{minutes}分"),
     }
 }
 
@@ -534,7 +685,9 @@ fn web_url(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use korylusfactory_protocol::{Step, Task as ReportTask, UpcomingPlan, Version, Wait};
+    use korylusfactory_protocol::{
+        Outcome, Role, Step, Task as ReportTask, UpcomingPlan, Version, Wait,
+    };
 
     use super::*;
 
@@ -550,6 +703,7 @@ mod tests {
                 commit: "abc1234".to_owned(),
             },
             running,
+            paused: false,
             progress,
             upcoming: Vec::new(),
         }
@@ -571,6 +725,7 @@ mod tests {
                 reason: "設計を変えてよいか".to_owned(),
             }),
             tasks: Vec::new(),
+            sessions: Vec::new(),
         }
     }
 
@@ -586,6 +741,13 @@ mod tests {
         Received {
             report,
             received_at: now() - SignedDuration::from_mins(minutes_ago),
+        }
+    }
+
+    fn paused(running: bool, progress: Vec<PlanProgress>) -> StatusReport {
+        StatusReport {
+            paused: true,
+            ..report(running, progress)
         }
     }
 
@@ -645,14 +807,42 @@ mod tests {
                 State::Idle,
                 "進めているものが無い",
             ),
+            (
+                Some(received(0, paused(false, vec![plan(None, None, None)]))),
+                State::Paused,
+                "停止を反映して待っていれば、進行中の計画書があっても停止中にする",
+            ),
+            (
+                Some(received(0, paused(false, Vec::new()))),
+                State::Paused,
+                "進行中の計画書が無くても停止中にする",
+            ),
+            (
+                Some(received(0, paused(true, Vec::new()))),
+                State::Running,
+                "セッションを実行していれば、停止中より実行中にする",
+            ),
+            (
+                Some(received(
+                    0,
+                    paused(false, vec![plan(None, None, Some("質問"))]),
+                )),
+                State::Waiting,
+                "人間を待っていれば、停止中より人間待ちにする",
+            ),
+            (
+                Some(received(6, paused(false, Vec::new()))),
+                State::Unreachable,
+                "5分を超えて届いていなければ、停止中より不通にする",
+            ),
         ] {
             assert_eq!(state(received.as_ref(), now()), want, "{why}");
         }
     }
 
     #[test]
-    fn 一覧は人間待ち_不通_実行中_計画書なしの順で同じ状態は設定の順に並べる() {
-        let directors: Vec<Director> = ["Idle", "Running", "Never", "Waiting", "Late"]
+    fn 一覧は人間待ち_不通_実行中_停止中_計画書なしの順で同じ状態は設定の順に並べる() {
+        let directors: Vec<Director> = ["Idle", "Paused", "Running", "Never", "Waiting", "Late"]
             .iter()
             .map(|project| Director {
                 vm: format!("{project}-factory"),
@@ -661,6 +851,7 @@ mod tests {
             .collect();
         let received = HashMap::from([
             ("Idle".to_owned(), received(0, report(false, Vec::new()))),
+            ("Paused".to_owned(), received(0, paused(false, Vec::new()))),
             ("Running".to_owned(), received(0, report(true, Vec::new()))),
             (
                 "Waiting".to_owned(),
@@ -677,7 +868,7 @@ mod tests {
 
         assert_eq!(
             names,
-            ["Waiting", "Never", "Late", "Running", "Idle"],
+            ["Waiting", "Never", "Late", "Running", "Paused", "Idle"],
             "並び順が違うか、設定から外したプロジェクトを出した"
         );
     }
@@ -738,6 +929,28 @@ mod tests {
             (
                 Some(received(0, report(false, Vec::new()))),
                 vec!["進めている作業計画書はありません"],
+            ),
+            (
+                Some(received(
+                    0,
+                    paused(false, vec![plan(Some("1-2"), Some("実装"), None)]),
+                )),
+                vec!["退会機能 作業計画書", "停止しています"],
+            ),
+            (
+                Some(received(0, {
+                    let mut report = paused(false, Vec::new());
+                    report.upcoming = vec![UpcomingPlan {
+                        title: "通知 作業計画書".to_owned(),
+                        url: None,
+                    }];
+                    report
+                })),
+                vec!["通知 作業計画書", "次に進める作業計画書 ・ 停止しています"],
+            ),
+            (
+                Some(received(0, paused(false, Vec::new()))),
+                vec!["停止しています"],
             ),
         ] {
             let item = item("Annict", received.as_ref(), now());
@@ -962,7 +1175,12 @@ mod tests {
             },
         ];
 
-        let detail = detail("Annict", Some(&received(3, report)), now());
+        let detail = detail(
+            "Annict",
+            Some(&received(3, report)),
+            Operation::Running,
+            now(),
+        );
 
         assert_eq!(detail.state, State::Running, "状態が違う");
         assert_eq!(
@@ -1002,13 +1220,272 @@ mod tests {
 
     #[test]
     fn 報告をまだ受け取っていないプロジェクトの画面は中身を持たない() {
-        let detail = detail("Annict", None, now());
+        let detail = detail("Annict", None, Operation::Paused, now());
 
         assert_eq!(detail.state, State::Unreachable, "不通にしなかった");
+        assert_eq!(detail.mismatch, None, "報告の無いときに食い違いを添えた");
         assert_eq!(detail.last_contact, None, "最後の連絡を作った");
         assert!(
             detail.plans.is_empty() && detail.upcoming.is_empty(),
             "受け取っていない報告から中身を作った"
+        );
+    }
+
+    #[test]
+    fn 稼働の設定と報告の停止が食い違うときだけ文言を添える() {
+        let stop = Some("停止に切り替えました。実行中のセッションが終わったところで停止します");
+        let resume = Some("稼働に切り替えました。ディレクターが設定を読むと再開します");
+        for (operation, report, minutes_ago, want, why) in [
+            (
+                Operation::Paused,
+                report(true, Vec::new()),
+                0,
+                stop,
+                "停止に切り替えたが、まだ反映していない",
+            ),
+            (
+                Operation::Running,
+                paused(false, Vec::new()),
+                0,
+                resume,
+                "稼働に戻したが、まだ反映していない",
+            ),
+            (
+                Operation::Paused,
+                paused(false, Vec::new()),
+                0,
+                None,
+                "停止を反映している",
+            ),
+            (
+                Operation::Running,
+                report(false, Vec::new()),
+                0,
+                None,
+                "稼働のまま",
+            ),
+            (
+                Operation::Paused,
+                report(true, Vec::new()),
+                6,
+                None,
+                "不通のときはディレクターが設定を読めない",
+            ),
+        ] {
+            let detail = detail(
+                "Annict",
+                Some(&received(minutes_ago, report)),
+                operation,
+                now(),
+            );
+
+            assert_eq!(detail.mismatch, want, "{why}");
+        }
+    }
+
+    /// 1-1のレビューのセッション。startedに起動し、endedに終わった (無ければ実行中)。
+    fn session(started: &str, ended: Option<&str>) -> Session {
+        Session {
+            task: Some("1-1".to_owned()),
+            step: Step {
+                kind: "review".to_owned(),
+                label: "レビュー".to_owned(),
+            },
+            review: Some(1),
+            role: Role {
+                kind: "reviewer".to_owned(),
+                label: "レビュアー".to_owned(),
+            },
+            agent: "codex".to_owned(),
+            model: None,
+            effort: None,
+            started_at: started.to_owned(),
+            ended_at: ended.map(str::to_owned),
+            result: ended.map(|_| Outcome {
+                kind: "recorded".to_owned(),
+                label: "Request Changes".to_owned(),
+            }),
+        }
+    }
+
+    fn session_texts(row: &SessionRow) -> Vec<String> {
+        row.parts
+            .iter()
+            .map(|part| match part {
+                SessionPart::Text(text) => text.clone(),
+                SessionPart::Model(model) => format!("`{model}`"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 終わったセッションは見出しに回数を添え_担当とエージェントと所要時間と結果を出す() {
+        let row = session_row(
+            &session("2026-11-19T07:30:00Z", Some("2026-11-19T07:42:30Z")),
+            now(),
+        );
+
+        assert_eq!(row.heading, "1-1のレビュー (1回目)", "見出しが違う");
+        assert_eq!(
+            session_texts(&row),
+            [
+                "レビュアー",
+                "Codex",
+                "既定のモデル",
+                "12分",
+                "Request Changes"
+            ],
+            "詳細が違う"
+        );
+    }
+
+    #[test]
+    fn 実行中のセッションは経過時間と実行中を出し_指定したモデルとeffortを添える() {
+        let running = Session {
+            task: Some("1-2".to_owned()),
+            step: Step {
+                kind: "implement".to_owned(),
+                label: "実装".to_owned(),
+            },
+            review: None,
+            role: Role {
+                kind: "implementer".to_owned(),
+                label: "作業者".to_owned(),
+            },
+            agent: "claude".to_owned(),
+            model: Some("claude-opus-5-5".to_owned()),
+            effort: Some("high".to_owned()),
+            ..session("2026-11-19T06:55:00Z", None)
+        };
+
+        let row = session_row(&running, now());
+
+        assert_eq!(row.heading, "1-2の実装", "見出しが違う");
+        assert_eq!(
+            session_texts(&row),
+            [
+                "作業者",
+                "Claude Code",
+                "`claude-opus-5-5`",
+                "high",
+                "1時間5分",
+                "実行中"
+            ],
+            "実行中のセッションの詳細が違う"
+        );
+    }
+
+    #[test]
+    fn タスクの無いセッションと知らないエージェントと結果の無い終わったセッションも出す() {
+        let report = Session {
+            task: None,
+            step: Step {
+                kind: "report".to_owned(),
+                label: "作業報告書の作成".to_owned(),
+            },
+            review: None,
+            agent: "gemini".to_owned(),
+            result: None,
+            ..session("2026-11-19T07:00:00Z", Some("2026-11-19T07:00:59Z"))
+        };
+
+        let row = session_row(&report, now());
+
+        assert_eq!(row.heading, "作業報告書の作成", "タスクの無い見出しが違う");
+        assert_eq!(
+            session_texts(&row),
+            ["レビュアー", "gemini", "既定のモデル", "1分未満"],
+            "結果の無い終わったセッションの詳細が違う"
+        );
+    }
+
+    #[test]
+    fn 終了時刻が無くても結果があれば時間を省いて結果を出す() {
+        let report = Session {
+            result: Some(Outcome {
+                kind: "recorded".to_owned(),
+                label: "Request Changes".to_owned(),
+            }),
+            ..session("2026-11-19T07:40:00Z", None)
+        };
+
+        let row = session_row(&report, now());
+
+        assert_eq!(
+            session_texts(&row),
+            ["レビュアー", "Codex", "既定のモデル", "Request Changes"],
+            "終了時刻が無い結果付きのセッションの詳細が違う"
+        );
+    }
+
+    #[test]
+    fn 所要時間は分と時間で表す() {
+        let at = |text: &str| text.parse::<Timestamp>().expect("時刻を読めなかった");
+        for (to, expected) in [
+            ("2026-11-19T08:00:59Z", "1分未満"),
+            ("2026-11-19T08:01:00Z", "1分"),
+            ("2026-11-19T08:59:59Z", "59分"),
+            ("2026-11-19T09:00:00Z", "1時間"),
+            ("2026-11-19T10:30:00Z", "2時間30分"),
+            ("2026-11-19T07:59:00Z", "1分未満"),
+        ] {
+            assert_eq!(
+                duration(at("2026-11-19T08:00:00Z"), at(to)),
+                expected,
+                "{to} までの所要時間が違う"
+            );
+        }
+    }
+
+    #[test]
+    fn 最近のセッションは進行中の作業計画書をまたいで新しい順に5件まで並べる() {
+        let first = PlanProgress {
+            sessions: vec![
+                session("2026-11-19T07:50:00Z", None),
+                session("2026-11-19T07:10:00Z", Some("2026-11-19T07:20:00Z")),
+                session("2026-11-19T07:00:00Z", Some("2026-11-19T07:05:00Z")),
+            ],
+            ..plan(None, None, None)
+        };
+        let second = PlanProgress {
+            sessions: vec![
+                session("2026-11-19T07:40:00Z", Some("2026-11-19T07:45:00Z")),
+                session("きのう", Some("2026-11-19T07:45:00Z")),
+                session("2026-11-19T07:30:00Z", Some("2026-11-19T07:35:00Z")),
+            ],
+            ..plan(None, None, None)
+        };
+
+        let rows = sessions(&[first, second], now());
+
+        let durations: Vec<String> = rows
+            .iter()
+            .map(|row| session_texts(row)[3].clone())
+            .collect();
+        assert_eq!(
+            durations,
+            ["10分", "5分", "5分", "10分", "5分"],
+            "新しい順に5件並べなかった"
+        );
+        assert_eq!(
+            session_texts(&rows[0]).last().map(String::as_str),
+            Some("実行中"),
+            "実行中のセッションを先頭に置かなかった"
+        );
+    }
+
+    #[test]
+    fn セッションの無い報告からは最近のセッションを作らない() {
+        let received = Received {
+            report: report(false, vec![plan(None, None, None)]),
+            received_at: now(),
+        };
+
+        let detail = detail("Annict", Some(&received), Operation::Running, now());
+
+        assert!(
+            detail.sessions.is_empty(),
+            "セッションの無い報告から行を作った"
         );
     }
 }

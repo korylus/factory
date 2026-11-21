@@ -17,7 +17,7 @@ use super::{
 };
 use crate::state::{
     DeferredFinding, HumanFinding, HumanReview, PlanState, ReviewRecord, ReviewTrail, Reviewer,
-    Step, Verdict, WaitKind,
+    Slot, Step, Verdict, WaitKind,
 };
 
 /// 人間キューの項目では選べない、選択肢に無い対応を表す選択肢の書き出し。
@@ -64,27 +64,18 @@ impl Target {
     }
 }
 
-/// number回目 (1始まり) のレビューを行うレビュアーを返す。
-///
-/// 修正したモデルが同じ変更を再レビューしないよう、Codexから始めて交互に替える。
-pub fn reviewer_for(number: u32) -> Reviewer {
-    if number % 2 == 1 {
-        Reviewer::Codex
-    } else {
-        Reviewer::Claude
-    }
-}
-
 /// レビューの完了を確かめてレビューを記録し、対応方針に回答する。
 ///
 /// 回答のあとは、修正・再レビュー・人間待ち・レビューの終わりのどれかに進める。
 /// タスクのレビューを終えたら次のタスクへ、作業報告書のレビューを終えたら作業報告書の確認の人間待ちへ進める。
 /// レビュードキュメントの不備はレビュアーが直せるため、状態を変えずに [`Error::Rejected`] で理由を返す。
-/// 現在の日時nowを、レビューを記録した時刻にする。
+/// 現在の日時nowを、レビューを記録した時刻にし、reviewerを、レビューのセッションを実際に動かしたレビュアーとして記録する。
+/// 開いているセッションの記録には、レビューの総合評価を書く。
 pub fn finish_review(
     state: &mut PlanState,
     project: &Project,
     now: Timestamp,
+    reviewer: Reviewer,
 ) -> Result<(), Error> {
     let target = target(state, Step::Review)?;
     let prefix = trail(state, &target)?
@@ -130,12 +121,19 @@ pub fn finish_review(
     let number = count(trail).saturating_add(1);
     trail.reviews.push(ReviewRecord {
         number,
-        role: reviewer_for(number),
+        role: reviewer,
         doc: path.clone(),
         verdict: document.verdict,
         at: now,
     });
     let limit = limit(trail);
+    if let Some(session) = state
+        .sessions
+        .last_mut()
+        .filter(|session| session.is_open())
+    {
+        session.verdict = Some(document.verdict);
+    }
     if document.verdict == Verdict::RequestChanges && number >= limit {
         let end = match target {
             Target::Task(_) => "次のタスクへ進みます",
@@ -227,7 +225,11 @@ pub fn resume(
     resumed.wait = None;
     resumed.notified = None;
     match kind {
-        WaitKind::HumanTask | WaitKind::Branch | WaitKind::RetryLimit | WaitKind::Question => {}
+        WaitKind::HumanTask
+        | WaitKind::Branch
+        | WaitKind::RetryLimit
+        | WaitKind::AgentSettings
+        | WaitKind::Question => {}
         WaitKind::Report => report::check_feedback(&resumed, doc)?,
         WaitKind::Review | WaitKind::ReviewLimit => {
             let target = target(&resumed, Step::Fix)?;
@@ -436,40 +438,58 @@ pub(super) fn next_review(state: &PlanState, doc: &PlanDocument) -> Result<Next,
         .clone()
         .ok_or_else(|| Error::NoReviewPrefix(target.label()))?;
     let number = count(trail).saturating_add(1);
-    let reviewer = reviewer_for(number);
+    let slot = Slot::for_review(number);
     Ok(match target {
         Target::Task(id) => Next::Review {
             task: doc.task(&id)?.clone(),
-            reviewer,
+            slot,
             number,
             prefix,
             repo: trail.review_repo.clone(),
         },
         Target::Report => Next::ReportReview {
             url: report_url(state)?,
-            reviewer,
+            slot,
             number,
             prefix,
         },
     })
 }
 
-/// 修正のステップで、次に行うことを返す。修正は、最後にレビューしたレビュアーが行う。
+/// 修正のステップで、次に行うことを返す。修正は、最後のレビューと同じ枠のレビュアーが行う。
 pub(super) fn next_fix(state: &PlanState, doc: &PlanDocument) -> Result<Next, Error> {
     let target = target(state, Step::Fix)?;
     let last = last_review(state, &target)?;
+    let slot = Slot::for_review(last.number);
     Ok(match target {
         Target::Task(id) => Next::Fix {
             task: doc.task(&id)?.clone(),
-            reviewer: last.role,
+            slot,
             doc: last.doc.clone(),
         },
         Target::Report => Next::ReportFix {
             url: report_url(state)?,
-            reviewer: last.role,
+            slot,
             doc: last.doc.clone(),
         },
     })
+}
+
+/// 進めているレビューか修正のステップの、レビューの回数を返す。
+///
+/// レビューならこれから行う回、修正なら最後のレビューの回を返す。ほかのステップや、数えられないときは `None` を返す。
+pub(super) fn session_review(state: &PlanState) -> Option<u32> {
+    match state.step? {
+        Step::Review => {
+            let target = target(state, Step::Review).ok()?;
+            Some(count(trail(state, &target).ok()?).saturating_add(1))
+        }
+        Step::Fix => {
+            let target = target(state, Step::Fix).ok()?;
+            Some(last_review(state, &target).ok()?.number)
+        }
+        _ => None,
+    }
 }
 
 /// 状態stateを、レビューの対象targetの次のレビューのステップにする。
@@ -731,6 +751,7 @@ mod tests {
     };
     use super::super::{Prepared, finish_implement, finish_prepare, next};
     use super::*;
+    use crate::state::SessionAgent;
     use std::fmt::Write as _;
 
     /// PLANのタスク1-1のレビュー接頭辞。タスクのリポジトリが本体と別のため、リポジトリ名を足す。
@@ -813,7 +834,7 @@ mod tests {
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::Review {
                 task: task(&plan, "1-1").clone(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 number: 1,
                 prefix: PREFIX.to_owned(),
                 repo: Some(PathBuf::from("/korylus-tools")),
@@ -842,7 +863,7 @@ mod tests {
             "docs/private/reviews/{PREFIX}-NNN.md に、このレビューのレビュードキュメント (前回より新しい連番) がありません"
         )];
         assert_eq!(
-            rejected(finish_review(&mut state, &project, now())),
+            rejected(finish_review(&mut state, &project, now(), Reviewer::Codex)),
             want,
             "レビュードキュメントが無いのに受け付けた"
         );
@@ -855,13 +876,14 @@ mod tests {
             "始めたときの最新のドキュメントを残していない"
         );
         assert_eq!(
-            rejected(finish_review(&mut state, &project, now())),
+            rejected(finish_review(&mut state, &project, now(), Reviewer::Codex)),
             want,
             "前からあるドキュメントを受け付けた"
         );
 
         write_review(&project, 2, "Approve", "");
-        finish_review(&mut state, &project, now()).expect("新しいドキュメントを受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("新しいドキュメントを受け付けなかった");
     }
 
     #[test]
@@ -869,7 +891,8 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         let path = write_review(&project, 1, "Approve", "");
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
 
         assert_eq!(
             trail_of(&state).reviews,
@@ -885,12 +908,73 @@ mod tests {
     }
 
     #[test]
+    fn レビューにはセッションを動かしたレビュアーを記録し_開いているセッションに評価を書く() {
+        let (_root, project) = project();
+        let mut state = reviewing(&project);
+        let plan = done();
+        assert!(
+            matches!(
+                next(&mut state, &plan).expect("次に行うことを決められなかった"),
+                Next::Review {
+                    slot: Slot::ReviewerOdd,
+                    number: 1,
+                    ..
+                }
+            ),
+            "1回目のレビューを奇数回目の枠にしなかった"
+        );
+        let agent = SessionAgent {
+            agent: "claude".to_owned(),
+            model: None,
+            effort: None,
+        };
+        super::super::begin_session(&mut state, agent, now()).expect("開始を記録できなかった");
+        write_review(&project, 1, "Request Changes", AUTO_FIX);
+
+        finish_review(&mut state, &project, now(), Reviewer::Claude)
+            .expect("レビューの完了を受け付けなかった");
+
+        assert_eq!(
+            trail_of(&state).reviews[0].role,
+            Reviewer::Claude,
+            "セッションを動かしたレビュアーを記録しなかった"
+        );
+        let session = &state.sessions[0];
+        assert_eq!(
+            (session.step, session.review, session.slot, session.verdict),
+            (
+                Step::Review,
+                Some(1),
+                Slot::ReviewerOdd,
+                Some(Verdict::RequestChanges)
+            ),
+            "セッションの記録にレビューの回数と枠と評価を書かなかった"
+        );
+        assert!(
+            matches!(
+                next(&mut state, &plan).expect("次に行うことを決められなかった"),
+                Next::Fix {
+                    slot: Slot::ReviewerOdd,
+                    ..
+                }
+            ),
+            "修正を、最後のレビューと同じ枠にしなかった"
+        );
+        assert_eq!(
+            session_review(&state),
+            Some(1),
+            "修正のレビューの回数を、最後のレビューの回にしなかった"
+        );
+    }
+
+    #[test]
     fn 自動対応可の指摘に推奨の選択肢で回答し_最後にレビューしたレビュアーが修正する() {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         let findings = format!("{AUTO_FIX}{AUTO_DEFER}");
         let path = write_review(&project, 1, "Request Changes", &findings);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
 
         let content = read(&project, &path);
         assert!(
@@ -912,7 +996,7 @@ mod tests {
             next(&mut state, &plan).expect("次に行うことを決められなかった"),
             Next::Fix {
                 task: task(&plan, "1-1").clone(),
-                reviewer: Reviewer::Codex,
+                slot: Slot::ReviewerOdd,
                 doc: path,
             }
         );
@@ -923,7 +1007,8 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         let first = write_review(&project, 1, "Request Changes", AUTO_FIX);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         finish_fix(&mut state, &done(), &project, &fixed()).expect("修正の完了を受け付けなかった");
 
         assert_eq!(
@@ -936,7 +1021,7 @@ mod tests {
             matches!(
                 next(&mut state, &plan).expect("次に行うことを決められなかった"),
                 Next::Review {
-                    reviewer: Reviewer::Claude,
+                    slot: Slot::ReviewerEven,
                     number: 2,
                     ..
                 }
@@ -945,7 +1030,8 @@ mod tests {
         );
 
         write_review(&project, 2, "Approve", "");
-        finish_review(&mut state, &project, now()).expect("再レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("再レビューの完了を受け付けなかった");
         assert_eq!(step_of(&state), (None, None), "タスクを終えていない");
     }
 
@@ -954,7 +1040,8 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         write_review(&project, 1, "Comment", AUTO_FIX);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             step_of(&state),
             (Some("1-1"), Some(Step::Fix)),
@@ -969,13 +1056,15 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         write_review(&project, 1, "Comment", AUTO_DEFER);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(step_of(&state), (None, None), "Commentで修正を挟んだ");
 
         let (_root, project) = super::super::tests::project();
         let mut state = reviewing(&project);
         write_review(&project, 1, "Request Changes", AUTO_DEFER);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             step_of(&state),
             (Some("1-1"), Some(Step::Review)),
@@ -988,7 +1077,8 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         write_review(&project, 1, "Request Changes", AUTO_FIX);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         let before = state.clone();
 
         let body = checked(&["1-1"]).replace("状態ファイルを作る。", "設計を書き換えた。");
@@ -1019,7 +1109,8 @@ mod tests {
         let mut state = reviewing(&project);
         let findings = format!("{AUTO_FIX}{NEEDS_HUMAN}");
         let path = write_review(&project, 1, "Request Changes", &findings);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
 
         let wait = state.wait.clone().expect("人間を待っていない");
         assert_eq!(wait.kind, WaitKind::Review, "人間を待つ場面が違う");
@@ -1096,7 +1187,8 @@ mod tests {
             record.review.review_limit = Some(1);
         }
         write_review(project, 1, "Request Changes", AUTO_FIX);
-        finish_review(&mut state, project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         state
     }
 
@@ -1137,7 +1229,7 @@ mod tests {
             matches!(
                 next(&mut state, &done()).expect("次に行うことを決められなかった"),
                 Next::Review {
-                    reviewer: Reviewer::Claude,
+                    slot: Slot::ReviewerEven,
                     number: 2,
                     ..
                 }
@@ -1162,7 +1254,8 @@ mod tests {
         let (_root, project) = super::super::tests::project();
         let mut state = reviewing(&project);
         write_review(&project, 1, "Request Changes", NEEDS_HUMAN);
-        finish_review(&mut state, &project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             rejected(resume(&mut state, &done(), &project, Some(5))),
             ["レビューの上限は、上限に達して人間を待っているときだけ延ばせます"]
@@ -1179,7 +1272,7 @@ mod tests {
             "Comment",
             &AUTO_FIX.replace("- [ ] 現状維持", "- [x] 現状維持"),
         );
-        let reasons = rejected(finish_review(&mut state, &project, now()));
+        let reasons = rejected(finish_review(&mut state, &project, now(), Reviewer::Codex));
         assert_eq!(
             reasons[0],
             format!(
@@ -1198,7 +1291,7 @@ mod tests {
                 "- [x] 修正案の通り直す (推奨)",
             ),
         );
-        finish_review(&mut state, &project, now())
+        finish_review(&mut state, &project, now(), Reviewer::Codex)
             .expect("推奨の選択肢へのチェックで受け付けなかった");
     }
 
@@ -1207,14 +1300,14 @@ mod tests {
         let (_root, project) = project();
         let mut state = reviewing(&project);
         let path = write_review(&project, 1, "LGTM", "");
-        let reasons = rejected(finish_review(&mut state, &project, now()));
+        let reasons = rejected(finish_review(&mut state, &project, now(), Reviewer::Codex));
         assert_eq!(
             reasons[0],
             format!("レビュードキュメント {} を読み取れません", path.display())
         );
 
         write_review(&project, 1, "Comment", &AUTO_FIX.replace(" (推奨)", ""));
-        let reasons = rejected(finish_review(&mut state, &project, now()));
+        let reasons = rejected(finish_review(&mut state, &project, now(), Reviewer::Codex));
         assert_eq!(
             reasons[0],
             format!(
@@ -1257,16 +1350,17 @@ mod tests {
     }
 
     #[test]
-    fn レビュアーはcodexから交互に替える() {
-        let reviewers: Vec<Reviewer> = (1..=4).map(reviewer_for).collect();
+    fn レビューの枠は奇数回目から交互に替える() {
+        let slots: Vec<Slot> = (1..=4).map(Slot::for_review).collect();
         assert_eq!(
-            reviewers,
+            slots,
             [
-                Reviewer::Codex,
-                Reviewer::Claude,
-                Reviewer::Codex,
-                Reviewer::Claude
-            ]
+                Slot::ReviewerOdd,
+                Slot::ReviewerEven,
+                Slot::ReviewerOdd,
+                Slot::ReviewerEven
+            ],
+            "レビューの回数から決めた枠が違う"
         );
     }
 
@@ -1290,7 +1384,8 @@ mod tests {
             "Request Changes",
             &format!("{AUTO_FIX}{needed}"),
         );
-        finish_review(&mut state, project, now()).expect("レビューの完了を受け付けなかった");
+        finish_review(&mut state, project, now(), Reviewer::Codex)
+            .expect("レビューの完了を受け付けなかった");
         assert_eq!(
             state.wait.as_ref().map(|wait| wait.kind),
             Some(WaitKind::Review),

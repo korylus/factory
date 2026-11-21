@@ -23,14 +23,14 @@ pub use korylus_workdoc::plan::{BaseBranch, Plan, Task};
 
 pub use answer::resume_with;
 pub use report::{Reported, complete, finish_report};
-pub use retry::{RETRY_LIMIT, Retry, ask, begin_session, retry};
+pub use retry::{RETRY_LIMIT, Retry, ask, begin_session, end_session, reject_settings, retry};
 pub(crate) use review::human_findings;
 pub use review::{
-    DEFAULT_REVIEW_LIMIT, Fixed, finish_fix, finish_report_fix, finish_review, resume, reviewer_for,
+    DEFAULT_REVIEW_LIMIT, Fixed, finish_fix, finish_report_fix, finish_review, resume,
 };
 
 use crate::state::{
-    PlanState, ReviewTrail, Reviewer, Step, TaskRecord, VerificationItem, Wait, WaitKind,
+    PlanState, ReviewTrail, Slot, Step, TaskRecord, VerificationItem, Wait, WaitKind,
 };
 
 /// 状態遷移を進められないときのエラー。
@@ -233,8 +233,8 @@ pub enum Next {
     Review {
         /// レビューするタスク。
         task: Task,
-        /// レビューするレビュアー。
-        reviewer: Reviewer,
+        /// レビューのセッションを動かす枠。
+        slot: Slot,
         /// そのタスクで何回目のレビューか (1始まり)。
         number: u32,
         /// レビュードキュメントの名前に使う接頭辞。
@@ -242,12 +242,12 @@ pub enum Next {
         /// `/korylus-review` の `repo=` に渡すリポジトリ。渡さないときは `None`。
         repo: Option<PathBuf>,
     },
-    /// 最後にレビューしたレビュアーが、回答した指摘を修正してコミットする。結果は [`finish_fix`] で記録する。
+    /// 最後のレビューと同じ枠のレビュアーが、回答した指摘を修正してコミットする。結果は [`finish_fix`] で記録する。
     Fix {
         /// 修正するタスク。
         task: Task,
-        /// 修正するレビュアー。
-        reviewer: Reviewer,
+        /// 修正のセッションを動かす枠。最後のレビューの回数から決める。
+        slot: Slot,
         /// 回答したレビュードキュメントの、プロジェクトのルートからの相対パス。
         doc: PathBuf,
     },
@@ -260,19 +260,19 @@ pub enum Next {
     ReportReview {
         /// レビューする作業報告書のURL。
         url: String,
-        /// レビューするレビュアー。
-        reviewer: Reviewer,
+        /// レビューのセッションを動かす枠。
+        slot: Slot,
         /// その回で何回目のレビューか (1始まり)。
         number: u32,
         /// レビュードキュメントの名前に使う接頭辞。
         prefix: String,
     },
-    /// 最後にレビューしたレビュアーが、回答した指摘に沿って作業報告書の下書きを直す。結果は [`finish_report_fix`] で記録する。
+    /// 最後のレビューと同じ枠のレビュアーが、回答した指摘に沿って作業報告書の下書きを直す。結果は [`finish_report_fix`] で記録する。
     ReportFix {
         /// 直す作業報告書のURL。
         url: String,
-        /// 直すレビュアー。
-        reviewer: Reviewer,
+        /// 修正のセッションを動かす枠。最後のレビューの回数から決める。
+        slot: Slot,
         /// 回答したレビュードキュメントの、プロジェクトのルートからの相対パス。
         doc: PathBuf,
     },
@@ -280,6 +280,22 @@ pub enum Next {
     Wait(Wait),
     /// 作業計画書の完了を記録した。
     Finished,
+}
+
+impl Next {
+    /// セッションを動かす枠を返す。セッションを起動しないこと (タスクの準備・人間待ち・終わり) なら `None` を返す。
+    pub fn slot(&self) -> Option<Slot> {
+        match self {
+            Next::Implement { .. } | Next::Work { .. } | Next::Report { .. } => {
+                Some(Slot::Implementer)
+            }
+            Next::Review { slot, .. }
+            | Next::Fix { slot, .. }
+            | Next::ReportReview { slot, .. }
+            | Next::ReportFix { slot, .. } => Some(*slot),
+            Next::Prepare { .. } | Next::Wait(_) | Next::Finished => None,
+        }
+    }
 }
 
 /// タスクの準備の結果。

@@ -1,0 +1,138 @@
+{% extends "layout.html" %} {% block title %}{{ name }}の設定 - {% endblock %}
+{% block scripts %}<script src="{{ crate::assets::settings_path() }}" defer></script>{% endblock %}
+{% block content %}
+<div class="px-2 md:-ms-2.5 md:px-0">
+  <a class="btn max-w-full" data-variant="ghost" href="{{ project_path }}"
+    ><svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m15 18-6-6 6-6"></path></svg
+    ><span class="truncate">{{ name }}</span></a
+  >
+</div>
+<h1 class="px-4 text-2xl font-semibold wrap-anywhere md:px-0">{{ name }}の設定</h1>
+{# スイッチを切ると値を送らないため、停止の隠し項目のあとにスイッチを置き、サーバーは同じ名前の最後の値を使う。 #}
+{# HTTPエラーでは本文をエラー画面に差し替える。応答が届かないときはフォームの中で知らせる。 #}
+<form
+  id="operation-form"
+  class="card"
+  data-size="sm"
+  method="post"
+  action="{{ operation_path }}"
+  hx-post="{{ operation_path }}"
+  hx-trigger="change, submit"
+  hx-sync="drop"
+  hx-select="#operation-form"
+  hx-swap="outerHTML"
+  hx-status:4xx="target:#main select:#main swap:outerHTML"
+  hx-status:5xx="target:#main select:#main swap:outerHTML"
+>
+  <section class="flex flex-col gap-4">
+    <input type="hidden" name="{{ OPERATION_FIELD }}" value="{{ Operation::Paused.value() }}" />
+    <div role="group" class="field" data-orientation="horizontal">
+      <section>
+        <label for="operation">このプロジェクトを稼働させる</label>
+        <p id="operation-description">
+          オフにすると、実行中のセッションが終わったところで停止します。依頼への回答には応じます。
+        </p>
+      </section>
+      <input
+        id="operation"
+        class="input"
+        type="checkbox"
+        role="switch"
+        name="{{ OPERATION_FIELD }}"
+        value="{{ Operation::Running.value() }}"
+        aria-describedby="operation-description"
+        {% if running %}checked{% endif %}
+      />
+    </div>
+    <div data-operation-error tabindex="-1" hidden>
+      <p class="text-sm">稼働の設定を保存できたか確認できませんでした。</p>
+      <a href="{{ settings::path(name) }}" class="btn" data-variant="outline">設定を読み直す</a>
+    </div>
+    {# htmxがフォームを初期化するまでは送信のボタンを出し、JavaScriptやhtmxが動かないときも保存できるようにする。 #}
+    <div data-operation-fallback>
+      <button class="btn" data-variant="outline" type="submit">保存する</button>
+    </div>
+  </section>
+</form>
+{# 通常のフォームの送信で送り、JavaScriptやhtmxが動かなくても保存できるようにする。 #}
+<form id="agents-form" class="card" data-size="sm" method="post" action="{{ agents_path }}">
+  <header>
+    <h2>担当ごとのエージェント</h2>
+    <p>モデルとeffortを空にすると、各CLIの既定値で動きます。変えた設定は、次に起動するセッションから使います。</p>
+  </header>
+  <section class="flex flex-col gap-4">
+    {% for input in slots %}{% if !loop.first %}
+    <hr />
+    {% endif %}{% let id = input.id() %}
+    <div
+      role="group"
+      class="field gap-2"
+      aria-labelledby="{{ id }}-heading"
+    >
+      <section>
+        <h3 id="{{ id }}-heading">{{ input.label() }}</h3>
+        <p>{{ input.description() }}</p>
+      </section>
+      <div class="flex flex-wrap gap-2">
+        <select
+          class="select min-w-fit flex-1"
+          name="{{ input.name("agent") }}"
+          aria-label="{{ input.label() }}のエージェント"
+        >
+          {% for agent in Agent::ALL %}
+          <option value="{{ agent.value() }}" {% if input.agent == agent.value() %}selected{% endif %}>
+            {{ agents::agent_label(*agent) }}
+          </option>
+          {% endfor %}
+        </select>
+        <select
+          class="select w-36 min-w-fit"
+          name="{{ input.name("effort") }}"
+          aria-label="{{ input.label() }}のeffort"
+        >
+          <option value="" {% if input.effort.is_empty() %}selected{% endif %}>既定のeffort</option>
+          {% for effort in Effort::ALL %}
+          <option value="{{ effort.value() }}" {% if input.effort == effort.value() %}selected{% endif %}>
+            {{ effort.value() }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <input
+        class="input font-mono text-base"
+        type="text"
+        name="{{ input.name("model") }}"
+        value="{{ input.model }}"
+        placeholder="既定のモデル"
+        aria-label="{{ input.label() }}のモデル"
+        autocomplete="off"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        {% if let Some(error) = input.error %}aria-invalid="true" aria-describedby="{{ id }}-model-error"{% if self.is_first_error(input) %} autofocus{% endif %}{% endif %}
+      />
+      {% if let Some(error) = input.error %}
+      <p id="{{ id }}-model-error" role="alert">{{ error }}</p>
+      {% endif %}{% if input.is_reviewer_even() %}
+      <p>2つの枠を同じにすると、修正したモデルが同じ変更を再レビューします。</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  <footer class="flex-col items-stretch gap-2">
+    <button class="btn" data-size="lg" type="submit">設定を保存する</button>
+    {% if let Some((datetime, ago)) = saved_at %}
+    <p class="text-xs text-muted-foreground"><time datetime="{{ datetime }}" class="tabular-nums">{{ ago }}</time>に保存</p>
+    {% endif %}
+  </footer>
+</form>
+{% endblock %}

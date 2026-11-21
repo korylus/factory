@@ -1,8 +1,10 @@
-//! 管制のウェブアプリへ、プロジェクトの状態の報告を送る。
+//! 管制のウェブアプリへ、プロジェクトの状態の報告を送り、人間が決めた稼働の設定を読む。
 //!
 //! `korylusfactory start` は、状態ファイルを書いたあとと一定の間隔ごとに、状態の報告を `PUT /api/v1/director/status` で送る。
 //! 送るのは別のスレッド ([`Reporter`]) で行い、ウェブアプリに届かなくても作業計画書を進め続ける。
 //! 届かないときは警告を出し、同じ理由の警告は届くようになるまで繰り返さない。
+//!
+//! 稼働の設定は、監督のループが作業を始める前に `GET /api/v1/director/settings` で読む ([`read_settings`])。
 
 use std::collections::HashSet;
 use std::fmt;
@@ -14,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use korylusfactory_core::flow::{Plan, PlanDocument};
-use korylusfactory_core::state::{PlanState, Store};
+use korylusfactory_core::state::{self, PlanState, SessionRecord, SessionResult, Slot, Store};
 use korylusfactory_protocol::{
-    PlanProgress, StatusReport, Step, Task, TaskStatus, UpcomingPlan, Version, Wait,
+    Outcome, PlanProgress, Role, Session, Settings, StatusReport, Step, Task, TaskStatus,
+    UpcomingPlan, Version, Wait,
 };
 use serde::Serialize;
 use ureq::http::Uri;
@@ -29,18 +32,27 @@ use crate::version::Build;
 /// ウェブアプリのURLからの、状態の報告を受け取るAPIのパス。
 pub const STATUS_PATH: &str = "/api/v1/director/status";
 
-/// 状態の報告を送る時間の上限。
+/// ウェブアプリのURLからの、稼働の設定を読むAPIのパス。
+pub const SETTINGS_PATH: &str = "/api/v1/director/settings";
+
+/// 稼働の設定の応答として読む本文の上限。設定は数十バイトのため、これを超える応答は設定として扱わない。
+const SETTINGS_LIMIT: u64 = 64 * 1024;
+
+/// 状態の報告を送る時間と、稼働の設定を読む時間の上限。
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 状態が変わらなくても状態の報告を送り直す間隔。ウェブアプリは、5分を超えて届かないプロジェクトを不通とみなす。
 pub const INTERVAL: Duration = Duration::from_mins(1);
 
-/// 設定のURLから組み立てた、状態の報告を送るエンドポイント。
+/// 設定のURLから組み立てた、状態の報告を送るエンドポイントと、稼働の設定を読むエンドポイント。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Endpoint(String);
+pub struct Endpoint {
+    status: String,
+    settings: String,
+}
 
 impl Endpoint {
-    /// ホストのあるHTTP(S) URLを読み、パスに報告APIを足す。
+    /// ホストのあるHTTP(S) URLを読み、パスに報告と設定のAPIを足す。
     pub fn parse(base: &str) -> Option<Self> {
         let uri: Uri = base.parse().ok()?;
         let authority = uri.authority()?;
@@ -53,15 +65,26 @@ impl Endpoint {
         {
             return None;
         }
-        let path = format!("{}{STATUS_PATH}", uri.path().trim_end_matches('/'));
-        let mut parts = uri.into_parts();
-        parts.path_and_query = Some(path.parse().ok()?);
-        Uri::from_parts(parts).ok().map(|uri| Self(uri.to_string()))
+        let base = uri.path().trim_end_matches('/');
+        let url = |api: &str| {
+            let mut parts = uri.clone().into_parts();
+            parts.path_and_query = Some(format!("{base}{api}").parse().ok()?);
+            Uri::from_parts(parts).ok().map(|uri| uri.to_string())
+        };
+        Some(Self {
+            status: url(STATUS_PATH)?,
+            settings: url(SETTINGS_PATH)?,
+        })
     }
 
     /// 報告を送るURL。
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.status
+    }
+
+    /// 稼働の設定を読むURL。
+    pub fn settings(&self) -> &str {
+        &self.settings
     }
 }
 
@@ -69,6 +92,9 @@ impl Endpoint {
 pub trait Transport: Send + Sync {
     /// urlへ、JSONの本文bodyをPUTで送り、応答のステータスコードを返す。届かなければ理由を返す。
     fn put(&self, url: &str, body: &[u8]) -> Result<u16, String>;
+
+    /// urlをGETで読み、応答のステータスコードと本文を返す。届かないか、本文を読めなければ理由を返す。
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String>;
 }
 
 /// HTTPで送る本物の経路。
@@ -100,6 +126,42 @@ impl Transport for Http {
             .send(body)
             .map(|response| response.status().as_u16())
             .map_err(|err| err.to_string())
+    }
+
+    fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Accept", "application/json")
+            .call()
+            .map_err(|err| err.to_string())?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(SETTINGS_LIMIT)
+            .read_to_vec()
+            .map_err(|err| err.to_string())?;
+        Ok((status, body))
+    }
+}
+
+/// endpointから、linkの経路で稼働の設定を読む。読めなければ、警告に書く理由を返す。
+pub fn read_settings(endpoint: &Endpoint, link: &Link) -> Result<Settings, String> {
+    match link.transport.get(endpoint.settings()) {
+        Ok((200, body)) => {
+            // Serdeは構造体を配列からも読めるため、APIが返すオブジェクトに限る。
+            if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+                return Err("ウェブアプリから受け取った稼働の設定を読み取れません: JSONオブジェクトではありません".to_owned());
+            }
+            serde_json::from_slice(&body).map_err(|err| {
+                format!("ウェブアプリから受け取った稼働の設定を読み取れません: {err}")
+            })
+        }
+        Ok((status, _)) => Err(format!(
+            "ウェブアプリが稼働の設定を返しませんでした (ステータス {status})"
+        )),
+        Err(reason) => Err(format!("ウェブアプリから稼働の設定を読めません: {reason}")),
     }
 }
 
@@ -286,11 +348,12 @@ impl Outbox {
 
 /// 状態の報告を作る。`sent_at` は空のままにし、送るときに埋める。
 ///
-/// buildは実行しているkorylusfactoryの版、runningはセッションを実行しているか、
+/// buildは実行しているkorylusfactoryの版、runningはセッションを実行しているか、pausedは停止を反映して待っているか、
 /// progressは進行中の作業計画書の計画書名と状態、entriesはロードマップのこれから進める作業計画書の並び。
 pub fn report(
     build: &Build,
     running: bool,
+    paused: bool,
     progress: &[(String, PlanState)],
     entries: &[Entry],
 ) -> StatusReport {
@@ -316,6 +379,7 @@ pub fn report(
             commit: build.commit.clone(),
         },
         running,
+        paused,
         progress: progress
             .iter()
             .map(|(name, state)| plan_progress(name, state))
@@ -349,6 +413,54 @@ fn plan_progress(name: &str, state: &PlanState) -> PlanProgress {
             reason: wait.reason.clone(),
         }),
         tasks,
+        sessions: state
+            .sessions
+            .iter()
+            .rev()
+            .take(RECENT_SESSIONS)
+            .map(session)
+            .collect(),
+    }
+}
+
+/// 状態の報告に載せる、作業計画書ごとの直近のセッションの数。
+const RECENT_SESSIONS: usize = 5;
+
+/// 状態ファイルのセッションの記録recordを、状態の報告のセッションにする。
+fn session(record: &SessionRecord) -> Session {
+    let (role, label) = match record.slot {
+        Slot::Implementer => ("implementer", "作業者"),
+        Slot::ReviewerOdd => ("reviewer_odd", "レビュアー"),
+        Slot::ReviewerEven => ("reviewer_even", "レビュアー"),
+    };
+    Session {
+        task: record.task.clone(),
+        step: Step {
+            kind: kind(&record.step),
+            label: record.step.label().to_owned(),
+        },
+        review: record.review,
+        role: Role {
+            kind: role.to_owned(),
+            label: label.to_owned(),
+        },
+        agent: record.agent.clone(),
+        model: record.model.clone(),
+        effort: record.effort.clone(),
+        started_at: record.started_at.to_string(),
+        ended_at: record.ended_at.map(|at| at.to_string()),
+        result: record.result.map(|result| Outcome {
+            kind: kind(&result),
+            label: result_label(result, record.verdict),
+        }),
+    }
+}
+
+/// セッションの結果の表示名。レビューを記録したときは、その総合評価 (例: `Request Changes`) にする。
+fn result_label(result: SessionResult, verdict: Option<state::Verdict>) -> String {
+    match (result, verdict) {
+        (SessionResult::Recorded, Some(verdict)) => verdict.as_str().to_owned(),
+        (result, _) => result.label().to_owned(),
     }
 }
 
@@ -385,10 +497,15 @@ mod tests {
 
     use super::*;
 
+    /// 設定を読んだときに返す結果。
+    type Answer = Result<(u16, Vec<u8>), String>;
+
     /// 送った本文を記録し、決めた結果を返す経路。
     struct Recorder {
         results: Mutex<Vec<Result<u16, String>>>,
         sent: Mutex<Vec<(String, StatusReport)>>,
+        /// 設定を読んだときに返す結果と、読んだURL。
+        settings: Mutex<(Option<Answer>, Vec<String>)>,
     }
 
     impl Recorder {
@@ -396,7 +513,18 @@ mod tests {
             Arc::new(Self {
                 results: Mutex::new(results),
                 sent: Mutex::new(Vec::new()),
+                settings: Mutex::new((None, Vec::new())),
             })
+        }
+
+        fn answering(result: Result<(u16, &[u8]), &str>) -> Arc<Self> {
+            let recorder = Self::new(Vec::new());
+            recorder.settings.lock().expect("結果を書けなかった").0 = Some(
+                result
+                    .map(|(status, body)| (status, body.to_vec()))
+                    .map_err(str::to_owned),
+            );
+            recorder
         }
 
         fn sent(&self) -> Vec<(String, StatusReport)> {
@@ -417,6 +545,15 @@ mod tests {
             } else {
                 results.remove(0)
             }
+        }
+
+        fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+            let mut settings = self.settings.lock().expect("結果を読めなかった");
+            settings.1.push(url.to_owned());
+            settings
+                .0
+                .clone()
+                .unwrap_or_else(|| Ok((200, br#"{"paused": false}"#.to_vec())))
         }
     }
 
@@ -445,25 +582,33 @@ mod tests {
     }
 
     fn sample(running: bool) -> StatusReport {
-        report(&build(), running, &[], &[])
+        report(&build(), running, false, &[], &[])
     }
 
     #[test]
-    fn 検証したurlのパスに報告先を足す() {
-        for (base, expected) in [
+    fn 検証したurlのパスに報告先と設定の読み取り先を足す() {
+        for (base, status, settings) in [
             (
                 "https://factory.example.com",
                 "https://factory.example.com/api/v1/director/status",
+                "https://factory.example.com/api/v1/director/settings",
             ),
             (
                 "http://[::1]:8080/factory/",
                 "http://[::1]:8080/factory/api/v1/director/status",
+                "http://[::1]:8080/factory/api/v1/director/settings",
             ),
         ] {
+            let endpoint = Endpoint::parse(base);
             assert_eq!(
-                Endpoint::parse(base).as_ref().map(Endpoint::as_str),
-                Some(expected),
+                endpoint.as_ref().map(Endpoint::as_str),
+                Some(status),
                 "報告の送り先が違う"
+            );
+            assert_eq!(
+                endpoint.as_ref().map(Endpoint::settings),
+                Some(settings),
+                "設定の読み取り先が違う"
             );
         }
         for invalid in [
@@ -480,6 +625,61 @@ mod tests {
                 "使えないURLを受け入れた: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn 稼働の設定を読み_読めなければ理由を返す() {
+        let endpoint = Endpoint::parse("https://factory.example.com").expect("URLを読めなかった");
+        let read = |result| {
+            let recorder = Recorder::answering(result);
+            let got = read_settings(
+                &endpoint,
+                &link(Arc::clone(&recorder), Arc::new(Mutex::new(Vec::new()))),
+            );
+            let urls = recorder
+                .settings
+                .lock()
+                .expect("記録を読めなかった")
+                .1
+                .clone();
+            assert_eq!(
+                urls,
+                ["https://factory.example.com/api/v1/director/settings"],
+                "読んだURLが違う"
+            );
+            got
+        };
+
+        assert_eq!(
+            read(Ok((200, br#"{"paused": true}"#))),
+            Ok(Settings {
+                paused: true,
+                ..Settings::default()
+            }),
+            "停止の設定を読めなかった"
+        );
+        assert_eq!(
+            read(Ok((404, b""))),
+            Err("ウェブアプリが稼働の設定を返しませんでした (ステータス 404)".to_owned()),
+            "200以外の応答の理由が違う"
+        );
+        assert_eq!(
+            read(Ok((200, b" \n{\"future\": 1}"))),
+            Ok(Settings::default()),
+            "停止を省いたオブジェクトを稼働として扱わなかった"
+        );
+        for body in [b"<html>".as_slice(), b"[]", b"[false]", b"{"] {
+            assert!(
+                read(Ok((200, body))).is_err_and(|reason| reason
+                    .starts_with("ウェブアプリから受け取った稼働の設定を読み取れません: ")),
+                "読めない本文 {body:?} を設定として扱った"
+            );
+        }
+        assert_eq!(
+            read(Err("接続できません")),
+            Err("ウェブアプリから稼働の設定を読めません: 接続できません".to_owned()),
+            "届かないときの理由が違う"
+        );
     }
 
     #[test]
@@ -611,6 +811,10 @@ mod tests {
                 }
                 self.recorder.put(url, body)
             }
+
+            fn get(&self, url: &str) -> Result<(u16, Vec<u8>), String> {
+                self.recorder.get(url)
+            }
         }
 
         let (started, first) = mpsc::channel();
@@ -689,7 +893,13 @@ mod tests {
             entry("次 作業計画書", State::NotFound),
         ];
 
-        let got = report(&build(), true, &[("demo".to_owned(), state)], &entries);
+        let got = report(
+            &build(),
+            true,
+            false,
+            &[("demo".to_owned(), state)],
+            &entries,
+        );
 
         let value = serde_json::to_value(&got).expect("JSONにできなかった");
         assert_eq!(
@@ -698,6 +908,7 @@ mod tests {
                 "sent_at": "",
                 "korylusfactory": {"version": "0.1.0", "commit": "abc1234"},
                 "running": true,
+                "paused": false,
                 "progress": [{
                     "name": "demo",
                     "title": "デモ 作業計画書",
@@ -709,11 +920,104 @@ mod tests {
                         {"number": "1-1", "title": "作る", "status": "done"},
                         {"number": "1-2", "title": "表示する", "status": "in_progress"},
                         {"number": "1-3", "title": "送る", "status": "pending"}
-                    ]
+                    ],
+                    "sessions": []
                 }],
                 "upcoming": [{"title": "次 作業計画書"}]
             }),
             "報告の中身が違う"
+        );
+    }
+
+    #[test]
+    fn 報告には直近5件のセッションを新しい順に載せ_レビューの結果は評価にする() {
+        let mut state = PlanState::new(
+            "https://wikino.example.com/s/example/pages/20",
+            "デモ 作業計画書".to_owned(),
+        );
+        let at = |text: &str| text.parse::<Timestamp>().expect("日時を読めなかった");
+        let record = |minute: u32| state::SessionRecord {
+            task: Some("1-1".to_owned()),
+            step: state::Step::Implement,
+            review: None,
+            slot: Slot::Implementer,
+            agent: "claude".to_owned(),
+            model: None,
+            effort: None,
+            started_at: at(&format!("2026-11-20T08:{minute:02}:00Z")),
+            ended_at: Some(at(&format!("2026-11-20T08:{minute:02}:30Z"))),
+            result: Some(SessionResult::Recorded),
+            verdict: None,
+        };
+        state.sessions = (0..5).map(record).collect();
+        state.sessions.push(state::SessionRecord {
+            step: state::Step::Review,
+            review: Some(2),
+            slot: Slot::ReviewerEven,
+            agent: "codex".to_owned(),
+            model: Some("gpt-5.3-codex".to_owned()),
+            effort: Some("high".to_owned()),
+            verdict: Some(state::Verdict::RequestChanges),
+            ..record(10)
+        });
+        state.sessions.push(state::SessionRecord {
+            step: state::Step::Fix,
+            review: Some(2),
+            slot: Slot::ReviewerEven,
+            ended_at: None,
+            result: None,
+            ..record(20)
+        });
+
+        let progress = plan_progress("demo", &state);
+
+        let value = serde_json::to_value(&progress.sessions).expect("JSONにできなかった");
+        assert_eq!(
+            value.as_array().map(Vec::len),
+            Some(5),
+            "直近5件に絞らなかった"
+        );
+        assert_eq!(
+            value[0],
+            serde_json::json!({
+                "task": "1-1",
+                "step": {"kind": "fix", "label": "修正"},
+                "review": 2,
+                "role": {"kind": "reviewer_even", "label": "レビュアー"},
+                "agent": "claude",
+                "started_at": "2026-11-20T08:20:00Z"
+            }),
+            "実行中のセッションの形が違う"
+        );
+        assert_eq!(
+            value[1],
+            serde_json::json!({
+                "task": "1-1",
+                "step": {"kind": "review", "label": "レビュー"},
+                "review": 2,
+                "role": {"kind": "reviewer_even", "label": "レビュアー"},
+                "agent": "codex",
+                "model": "gpt-5.3-codex",
+                "effort": "high",
+                "started_at": "2026-11-20T08:10:00Z",
+                "ended_at": "2026-11-20T08:10:30Z",
+                "result": {"kind": "recorded", "label": "Request Changes"}
+            }),
+            "レビューのセッションの形が違う"
+        );
+        assert_eq!(
+            value[2]["role"],
+            serde_json::json!({"kind": "implementer", "label": "作業者"}),
+            "作業者の担当の形が違う"
+        );
+        assert_eq!(
+            value[2]["result"],
+            serde_json::json!({"kind": "recorded", "label": "記録した"}),
+            "レビュー以外の結果の表示名が違う"
+        );
+        assert_eq!(
+            value[4]["started_at"], "2026-11-20T08:02:00Z",
+            "古いセッションから省かなかった"
         );
     }
 }

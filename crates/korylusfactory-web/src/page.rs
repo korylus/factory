@@ -6,7 +6,12 @@ use askama::Template;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::projects::{self, Detail, Item, Part, State};
+use jiff::Timestamp;
+use korylusfactory_protocol::{Agent, Effort};
+
+use crate::agents::{self, AgentsForm, SlotInput};
+use crate::projects::{self, Detail, Item, Part, SessionPart, State};
+use crate::settings::{self, OPERATION_FIELD, Operation};
 
 /// HTMLの応答に付けるContent-Security-Policy。
 ///
@@ -40,6 +45,7 @@ impl ProjectList {
 pub struct ProjectPage {
     detail: Detail,
     path: String,
+    settings_path: String,
 }
 
 impl ProjectPage {
@@ -47,12 +53,52 @@ impl ProjectPage {
     pub fn new(detail: Detail) -> Self {
         Self {
             path: projects::path(&detail.name),
+            settings_path: settings::path(&detail.name),
             detail,
         }
     }
 }
 
-/// 404と500の画面。
+/// プロジェクトの設定の画面。
+#[derive(Debug, Template)]
+#[template(path = "settings.html")]
+pub struct SettingsPage {
+    name: String,
+    project_path: String,
+    operation_path: String,
+    running: bool,
+    agents_path: String,
+    slots: Vec<SlotInput>,
+    /// 最後に保存した時刻 (`<time datetime>` に入れる値と、相対の表現)。
+    saved_at: Option<(String, String)>,
+}
+
+impl SettingsPage {
+    /// プロジェクトの名前と、稼働の設定と、担当ごとのエージェントのフォームの値から画面を作る。nowは今の時刻。
+    pub fn new(name: &str, operation: Operation, agents: AgentsForm, now: Timestamp) -> Self {
+        Self {
+            name: name.to_owned(),
+            project_path: projects::path(name),
+            operation_path: settings::operation_path(name),
+            running: !operation.is_paused(),
+            agents_path: agents::path(name),
+            slots: agents.slots,
+            saved_at: agents
+                .saved_at
+                .map(|time| (projects::datetime(time), projects::ago(time, now))),
+        }
+    }
+
+    /// inputが最初にエラーのある枠かを返す。読み込んだときに、その入力欄へフォーカスを移す。
+    fn is_first_error(&self, input: &SlotInput) -> bool {
+        self.slots
+            .iter()
+            .find(|slot| slot.error.is_some())
+            .is_some_and(|slot| slot.slot == input.slot)
+    }
+}
+
+/// 画面の要求が失敗したときに、見出しと案内を共通の枠で描く。
 #[derive(Debug, Template)]
 #[template(path = "error.html")]
 struct ErrorPage {
@@ -77,6 +123,28 @@ pub fn not_found() -> Response {
         &ErrorPage {
             heading: "ページが見つかりません",
             message: "URLが正しいかを確かめてください。",
+        },
+    )
+}
+
+/// 送られた値を受け付けられないときの400の画面を返す。
+pub fn bad_request() -> Response {
+    render(
+        StatusCode::BAD_REQUEST,
+        &ErrorPage {
+            heading: "送られた内容を受け付けられません",
+            message: "画面を開き直してから、もう一度操作してください。",
+        },
+    )
+}
+
+/// 操作を許可しないときの403の画面を返す。
+pub fn forbidden() -> Response {
+    render(
+        StatusCode::FORBIDDEN,
+        &ErrorPage {
+            heading: "この操作は許可されていません",
+            message: "Korylus Factoryの画面を開き直してから、もう一度操作してください。",
         },
     )
 }
@@ -139,6 +207,7 @@ fn html(status: StatusCode, body: String) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::body;
+    use korylusfactory_protocol::{InvalidAgentSetting, Slot};
 
     use super::*;
     use crate::assets;
@@ -179,6 +248,7 @@ mod tests {
             assets::htmx_path(),
             assets::sse_path(),
             assets::theme_path(),
+            assets::project_status_path(),
         ] {
             assert!(
                 html.contains(&format!(r#""{path}""#)),
@@ -266,9 +336,37 @@ mod tests {
             render(StatusCode::OK, &ProjectList::new(Vec::new())),
             render(
                 StatusCode::OK,
-                &ProjectPage::new(projects::detail("Annict", None, jiff::Timestamp::now())),
+                &ProjectPage::new(projects::detail(
+                    "Annict",
+                    None,
+                    Operation::Running,
+                    jiff::Timestamp::now(),
+                )),
+            ),
+            render(
+                StatusCode::OK,
+                &SettingsPage::new(
+                    "Annict",
+                    Operation::Paused,
+                    AgentsForm {
+                        slots: Slot::ALL
+                            .into_iter()
+                            .map(|slot| SlotInput {
+                                slot,
+                                agent: "codex".to_owned(),
+                                effort: String::new(),
+                                model: "-c".to_owned(),
+                                error: Some(InvalidAgentSetting::Model),
+                            })
+                            .collect(),
+                        saved_at: Some(jiff::Timestamp::now()),
+                    },
+                    jiff::Timestamp::now(),
+                ),
             ),
             not_found(),
+            bad_request(),
+            forbidden(),
             internal_error(),
         ] {
             let html = body_text(response).await;
@@ -307,9 +405,9 @@ mod tests {
             "404の画面のタイトルが違う"
         );
         assert!(
-            body_text(internal_error).await.contains(
-                "<h1 class=\"px-4 text-2xl font-semibold md:px-0\">エラーが起きました</h1>"
-            ),
+            body_text(internal_error)
+                .await
+                .contains("tabindex=\"-1\" autofocus>エラーが起きました</h1>"),
             "500の画面の見出しが違う"
         );
     }

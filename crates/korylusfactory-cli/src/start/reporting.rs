@@ -59,7 +59,8 @@ impl Reporting {
         }
     }
 
-    pub(super) fn update(&mut self, running: bool, now: Timestamp) {
+    /// 状態を読み直し、セッションを実行しているかrunningと、停止を反映して待っているかpausedと合わせて送信スレッドへ渡す。
+    pub(super) fn update(&mut self, running: bool, paused: bool, now: Timestamp) {
         match self.read_progress() {
             Ok(progress) => {
                 self.progress = progress;
@@ -77,6 +78,7 @@ impl Reporting {
         self.reporter.update(web::report(
             &self.build,
             running,
+            paused,
             &self.progress,
             &self.entries,
         ));
@@ -180,6 +182,10 @@ mod tests {
             self.0.send(report).expect("状態の報告を記録できなかった");
             Ok(204)
         }
+
+        fn get(&self, _: &str) -> Result<(u16, Vec<u8>), String> {
+            Ok((200, br#"{"paused": false}"#.to_vec()))
+        }
     }
 
     fn next_report(received: &mpsc::Receiver<StatusReport>, context: &str) -> StatusReport {
@@ -255,7 +261,7 @@ mod tests {
         let mut reporting =
             Reporting::new(endpoint, &start, &config).expect("報告を始められなかった");
         reporting.use_roadmap(Vec::new(), now);
-        reporting.update(false, now);
+        reporting.update(false, false, now);
         let first = next_report(&received, "初回の報告が届かなかった");
         assert_eq!(first.progress.len(), 1, "初回の状態が欠けている");
         let (locked, confirmed) = mpsc::channel();
@@ -271,7 +277,7 @@ mod tests {
             .recv_timeout(timeout)
             .expect("ロックを取れなかった");
 
-        reporting.update(true, later);
+        reporting.update(true, false, later);
         started
             .recv_timeout(timeout)
             .expect("ロードマップの更新が始まらなかった");
@@ -281,7 +287,7 @@ mod tests {
             during.progress, first.progress,
             "前に読んだ状態を保持していない"
         );
-        reporting.update(false, later);
+        reporting.update(false, false, later);
         let after = next_report(&received, "ロードマップを待つ間に次の報告が届かなかった");
         assert!(!after.running, "次の状態の変更を反映していない");
         unlock.send(()).expect("ロックの解放を知らせられなかった");
