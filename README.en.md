@@ -59,7 +59,7 @@ To send the state to the control web app, also write its URL.
 | `notify`        | The command that announces human waits (`command`: an array of the command and its arguments), run without a shell. When omitted, nothing is announced                                 |
 | `web`           | The control web app to send the state to (`url`: the web app's URL). The state is sent after writing a state file and every minute. When omitted, nothing is sent                      |
 
-A section missing from the roadmap, an approved section also listed as done, or an unknown field is treated as a mistake and reported as an error.
+A section missing from the roadmap, an approved section heading that appears more than once in the roadmap, an approved section also listed as done, or an unknown field is treated as a mistake and reported as an error.
 
 The roadmap and work plans are read with the `wikino` command, preferring the draft when there is one.
 Read permission on the token used for `wikino auth login <space>` is enough for korylusfactory itself.
