@@ -16,6 +16,12 @@ pub enum Error {
     #[error("ロードマップに、承認とみなす節 「{0}」 がありません")]
     MissingSection(String),
 
+    /// 承認とみなす節が複数あり、どの節から作業計画書を選ぶか決められない。
+    #[error(
+        "ロードマップに、承認とみなす節「{0}」が複数あります。見出しが1つになるように直してください"
+    )]
+    DuplicateSection(String),
+
     /// 完了とみなす節が、ロードマップに無い。節の名前の書き誤りで完了を見落とさないよう、エラーにする。
     #[error("ロードマップに、完了とみなす節 {} がありません", .0.iter().map(|s| format!("「{s}」")).collect::<Vec<_>>().join("・"))]
     MissingDoneSections(Vec<String>),
@@ -95,20 +101,23 @@ pub fn head(entries: &[Entry]) -> Head<'_> {
 ///
 /// 項目のWikiリンクのうち、タイトルが「作業計画書」で終わるものだけを候補にし、
 /// 同じリンクが複数の項目にあれば最初のものだけを残す。
+/// 見出しが見つからないか、複数の節が同じ見出しを持つときはエラーを返す。
 pub fn candidates(src: &str, section: &str) -> Result<Vec<Candidate>, Error> {
     let roadmap = roadmap::parse(src);
-    if !roadmap.sections.iter().any(|s| s.title == section) {
+    let mut sections = roadmap.sections.iter().filter(|s| s.title == section);
+    let Some(approved) = sections.next() else {
         return Err(Error::MissingSection(section.to_owned()));
+    };
+    if sections.next().is_some() {
+        return Err(Error::DuplicateSection(section.to_owned()));
     }
 
     let mut seen = HashSet::new();
-    Ok(roadmap
-        .sections
+    Ok(approved
+        .items
         .iter()
-        .filter(|s| s.title == section)
-        .flat_map(|s| &s.items)
         .flat_map(|item| &item.links)
-        .filter(|link| link.is_plan() && seen.insert((*link).clone()))
+        .filter(|link| link.is_plan() && seen.insert(*link))
         .map(|link| Candidate {
             section: section.to_owned(),
             link: link.clone(),
@@ -217,14 +226,19 @@ mod tests {
                 candidate("やってる", None, "退会機能 作業計画書"),
                 candidate("やってる", None, "言語方針 作業計画書"),
                 candidate("やってる", Some("Annict"), "通知 作業計画書"),
-            ]
+            ],
+            "承認とみなす節のリンクを、重複を除いて先頭から並べていない"
         );
     }
 
     #[test]
     fn 優先度の節の作業計画書を並びに入れない() {
         let got = candidates(ROADMAP, DEFAULT_SECTION).expect("候補を決められなかった");
-        assert_eq!(got, [candidate("やってる", None, "退会機能 作業計画書")]);
+        assert_eq!(
+            got,
+            [candidate("やってる", None, "退会機能 作業計画書")],
+            "既定の承認見出しにある作業計画書だけを選んでいない"
+        );
     }
 
     #[test]
@@ -235,17 +249,34 @@ mod tests {
             [
                 candidate("優先度: 高", Some("Annict"), "言語方針 作業計画書"),
                 candidate("優先度: 高", None, "退会機能 作業計画書"),
-            ]
+            ],
+            "指定した節の作業計画書の並びが異なる"
         );
     }
 
     #[test]
     fn 承認とみなす節がロードマップに無ければエラー() {
         let err = candidates(ROADMAP, "優先度：高").expect_err("エラーにならなかった");
-        assert_eq!(err, Error::MissingSection("優先度：高".to_owned()));
+        assert_eq!(
+            err,
+            Error::MissingSection("優先度：高".to_owned()),
+            "見つからなかった見出しが異なる"
+        );
         assert_eq!(
             err.to_string(),
-            "ロードマップに、承認とみなす節 「優先度：高」 がありません"
+            "ロードマップに、承認とみなす節 「優先度：高」 がありません",
+            "見つからなかった見出しのエラーメッセージが異なる"
+        );
+    }
+
+    #[test]
+    fn 承認とみなす節の見出しが重複すればエラー() {
+        let roadmap = format!("{ROADMAP}\n## やってる\n\n- [[重複した節の 作業計画書]]\n");
+        let err = candidates(&roadmap, DEFAULT_SECTION).expect_err("見出しの重複を見逃した");
+        assert_eq!(
+            err,
+            Error::DuplicateSection(DEFAULT_SECTION.to_owned()),
+            "重複した承認見出しが異なる"
         );
     }
 

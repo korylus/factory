@@ -144,12 +144,18 @@ pub enum Error {
 #[serde(deny_unknown_fields)]
 struct File {
     roadmap: String,
-    section: Option<String>,
+    #[serde(default = "default_section")]
+    section: String,
     done_sections: Option<Vec<String>>,
     project: Option<String>,
     queue: Option<QueueFile>,
     notify: Option<NotifyFile>,
     web: Option<WebFile>,
+}
+
+/// 設定で承認とみなす節を省略したときの見出し。
+fn default_section() -> String {
+    DEFAULT_SECTION.to_owned()
 }
 
 /// 設定ファイルの「web」の形。
@@ -228,11 +234,10 @@ pub fn load(root: &Path) -> Result<Config, Error> {
             path: path.clone(),
             source: Box::new(source),
         })?;
-    let section = match file.section {
-        Some(section) if section.is_empty() => return Err(Error::NoSection(path)),
-        Some(section) => section,
-        None => DEFAULT_SECTION.to_owned(),
-    };
+    let section = file.section;
+    if section.is_empty() {
+        return Err(Error::NoSection(path));
+    }
     let done_sections = match file.done_sections {
         Some(done) if done.is_empty() => return Err(Error::NoDoneSections(path)),
         Some(done) => done,
@@ -552,6 +557,10 @@ mod tests {
             (
                 "sectionが配列",
                 r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": ["やってる"]}"#,
+            ),
+            (
+                "sectionがnull",
+                r#"{"roadmap": "https://wikino.app/s/shimbaco/pages/1", "section": null}"#,
             ),
             (
                 "queueに知らない項目がある",
